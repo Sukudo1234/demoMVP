@@ -5,10 +5,14 @@ const supa = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE
 const AUPH = "https://auphonic.com/api";
 
 async function claimJob() {
-  const { data: jobs } = await supa.from("jobs").select("*").eq("type","enhance").eq("status","queued").limit(1);
+  const { data: jobs } = await supa
+    .from("jobs").select("*")
+    .eq("type","enhance").eq("status","queued").limit(1);
   if (!jobs || !jobs.length) return null;
   const job = jobs[0];
-  const { error } = await supa.from("jobs").update({ status:"running", updated_at: new Date().toISOString() }).eq("id", job.id);
+  const { error } = await supa.from("jobs")
+    .update({ status:"running", updated_at: new Date().toISOString() })
+    .eq("id", job.id);
   if (error) return null;
   return job;
 }
@@ -50,7 +54,9 @@ async function runOnce() {
       let doneUrl = "";
       while (!doneUrl) {
         await new Promise(r=>setTimeout(r,3000));
-        const st = await fetch(`${AUPH}/production/${uuid}.json`, { headers: { "Authorization": `bearer ${process.env.AUPHONIC_API_KEY}` } }).then(r=>r.json());
+        const st = await fetch(`${AUPH}/production/${uuid}.json`, {
+          headers: { "Authorization": `bearer ${process.env.AUPHONIC_API_KEY}` }
+        }).then(r=>r.json());
         await log(job.id, "progress", { status: st?.data?.status_string });
         if (st?.data?.status === "done") {
           const dl = st?.data?.output_files?.[0]?.download_url;
@@ -63,14 +69,17 @@ async function runOnce() {
 
       const outPath = `outputs/${job.id}/${Date.now()}.wav`;
       const buf = Buffer.from(await (await fetch(doneUrl)).arrayBuffer());
-      const { error: upErr } = await supa.storage.from("outputs").upload(outPath, buf, { contentType: "audio/wav", upsert: true });
+      const { error: upErr } = await supa.storage.from("outputs")
+        .upload(outPath, buf, { contentType: "audio/wav", upsert: true });
       if (upErr) throw upErr;
 
       const publicUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/${outPath}`;
       outputs.push(publicUrl);
     }
 
-    await supa.from("jobs").update({ status:"completed", result_url: outputs.length===1 ? outputs[0] : null }).eq("id", job.id);
+    await supa.from("jobs")
+      .update({ status:"completed", result_url: outputs.length===1 ? outputs[0] : null })
+      .eq("id", job.id);
     await log(job.id, "Completed", { outputs });
   } catch (e) {
     await supa.from("jobs").update({ status:"failed", error: String(e) }).eq("id", job.id);
