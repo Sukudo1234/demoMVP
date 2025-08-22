@@ -12,3 +12,17 @@
     "node-fetch": "^3.3.2"
   }
 }
+
+{
+  "name": "mvp-worker",
+  "private": true,
+  "type": "module",
+  "version": "0.0.2",
+  "main": "index.js",
+  "scripts": { "start": "node index.js" },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.56.0",
+    "node-fetch": "^3.3.2",
+    "ffmpeg-static": "^5.2.0"
+  }
+}
