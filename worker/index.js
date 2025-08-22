@@ -1,90 +1,82 @@
-import fetch from "node-fetch";
+/* minimal open-source worker (ffmpeg static) */
 import { createClient } from "@supabase/supabase-js";
+import fetch from "node-fetch";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { spawn } from "node:child_process";
+import ffmpegPath from "ffmpeg-static";
 
-const supa = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE);
-const AUPH = "https://auphonic.com/api";
+const supa = createClient(process.envSUPABASE_URL || process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE);
 
-async function claimJob() {
-  const { data: jobs } = await supa
-    .from("jobs").select("*")
-    .eq("type","enhance").eq("status","queued").limit(1);
-  if (!jobs || !jobs.length) return null;
-  const job = jobs[0];
-  const { error } = await supa.from("jobs")
-    .update({ status:"running", updated_at: new Date().toISOString() })
-    .eq("id", job.id);
-  if (error) return null;
+async function log(job_id, message, data=null) {
+  await supa.from("job_events").insert({ job_id, message, data }).throwOnError();
+  console.log(`[${job_id}] ${message}`, data ?? "");
+}
+
+async function claim() {
+  const { data } = await supa.from("jobs").select("*").eq("type","enhance").eq("status","queued").order("created_at").limit(1);
+  if (!data?.length) return null;
+  const job = data[0];
+  await supa.from("jobs").update({ status:"running", updated_at: new Date().toISOString() }).eq("id", job.id);
   return job;
 }
 
-async function log(job_id, message, data=null) {
-  await supa.from("job_events").insert({ job_id, message, data });
-  console.log(`[${job_id}] ${message}`, data ? JSON.stringify(data).slice(0,200) : "");
+async function downloadInput(objPath) {
+  // objPath is like "<jobId>/<filename>"
+  const { data, error } = await supa.storage.from("inputs").download(objPath);
+  if (error) throw error;
+  const tmp = path.join(os.tmpdir(), `${Date.now()}-${path.basename(objPath)}`);
+  await fs.writeFile(tmp, Buffer.from(await data.arrayBuffer()));
+  return tmp;
 }
 
-async function runOnce() {
-  const job = await claimJob();
-  if (!job) return;
+function runFfmpeg(infile, outfile) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      "-y", "-i", infile,
+      "-af", "highpass=f=80,deesser=i=6.0:m=0.6:fc=6000:fw=1.5,arnndn=m=rnnoise-models/rnnoise.rnnn,loudnorm=I=-24:TP=-2:LRA=11,alimiter=limit=0.95",
+      "-ar", "48000", "-ac", "1",
+      outfile
+    ];
+    const p = spawn(ffmpegPath, args);
+    let out=""; p.stdout.on("data", d=> out+=d); p.stderr.on("data", d=> out+=d);
+    p.on("close", code => code===0 ? resolve(out) : reject(new Error(out)));
+  });
+}
 
+async function uploadOutput(jobId, localFile) {
+  const obj = `outputs/${jobId}/${path.basename(localFile).replace(/\.[^.]+$/, "")}-enhanced.wav`;
+  const buf = await fs.readFile(localFile);
+  const { error } = await supa.storage.from("outputs").upload(obj, buf, { contentType:"audio/wav", upsert:true });
+  if (error) throw error;
+  // store only the object path (without bucket) for private buckets
+  await supa.from("jobs").update({ result_url: obj }).eq("id", jobId);
+  return obj;
+}
+
+async function once() {
+  const job = await claim(); if (!job) return;
   try {
-    await log(job.id, "Started");
+    await log(job.id, "Started", { files: job.input_urls });
+    // job.input_urls must be raw object paths like "<jobId>/<file>"
     const outputs = [];
-
-    for (const input of job.input_urls) {
-      const res = await fetch(`${AUPH}/productions.json`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Authorization": `bearer ${process.env.AUPHONIC_API_KEY}` },
-        body: JSON.stringify({
-          input_file: input,
-          algorithms: {
-            filtering: true,
-            leveler: true,
-            normloudness: true, loudnesstarget: -24,
-            denoise: true, denoisemethod: "dynamic",
-            deverbamount: 0,
-            silence_cutter: true
-          },
-          output_files: [{ format: "wav" }]
-        })
-      });
-      const prod = await res.json();
-      const uuid = prod?.data?.uuid;
-      if (!uuid) throw new Error("Auphonic production not created");
-
-      let doneUrl = "";
-      while (!doneUrl) {
-        await new Promise(r=>setTimeout(r,3000));
-        const st = await fetch(`${AUPH}/production/${uuid}.json`, {
-          headers: { "Authorization": `bearer ${process.env.AUPHONIC_API_KEY}` }
-        }).then(r=>r.json());
-        await log(job.id, "progress", { status: st?.data?.status_string });
-        if (st?.data?.status === "done") {
-          const dl = st?.data?.output_files?.[0]?.download_url;
-          if (!dl) throw new Error("Output URL missing");
-          doneUrl = dl;
-        } else if (st?.data?.status === "error") {
-          throw new Error(st?.data?.error_message || "Auphonic error");
-        }
-      }
-
-      const outPath = `outputs/${job.id}/${Date.now()}.wav`;
-      const buf = Buffer.from(await (await fetch(doneUrl)).arrayBuffer());
-      const { error: upErr } = await supa.storage.from("outputs")
-        .upload(outPath, buf, { contentType: "audio/wav", upsert: true });
-      if (upErr) throw upErr;
-
-      const publicUrl = `${process.env.SUPABASE_URL}/storage/v1/object/public/${outPath}`;
-      outputs.push(publicUrl);
+    for (const p of job.input_urls) {
+      await log(job.id, "progress", { step:"download", path:p });
+      const infile = await downloadInput(p);
+      const outfile = path.join(os.tmpdir(), `${Date.now()}-out.wav`);
+      await log(job.id, "progress", { step:"enhance" });
+      await runFfmpeg(infile, outfile);
+      await log(job.id, "progress", { step:"upload" });
+      const outObj = await uploadOutput(job.id, outfile);
+      outputs.push(outObj);
     }
-
-    await supa.from("jobs")
-      .update({ status:"completed", result_url: outputs.length===1 ? outputs[0] : null })
-      .eq("id", job.id);
+    await supa.from("jobs").update({ status:"completed" }).eq("id", job.id);
     await log(job.id, "Completed", { outputs });
   } catch (e) {
-    await supa.from("jobs").update({ status:"failed", error: String(e) }).eq("id", job.id);
-    await log(job.id, "Failed", { error: String(e) });
+    await supa.from("jobs").update({ status:"failed", error:String(e) }).eq("id", job.id);
+    await log(job.id, "Failed", { error:String(e) });
   }
 }
 
-setInterval(runOnce, 2000);
+setInterval(once, 2000);
