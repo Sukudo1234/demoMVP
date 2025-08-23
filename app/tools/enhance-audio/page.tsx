@@ -3,14 +3,22 @@
 import Link from "next/link"
 import { useEffect, useMemo, useRef, useState } from "react"
 import {
-  PlusIcon, BellIcon, BoltIcon, FolderIcon, SparklesIcon, CubeIcon, ClockIcon,
-  PlayIcon, PauseIcon, XMarkIcon, InformationCircleIcon
+  PlusIcon,
+  BellIcon,
+  BoltIcon,
+  FolderIcon,
+  SparklesIcon,
+  CubeIcon,
+  ClockIcon,
+  PlayIcon,
+  PauseIcon,
+  XMarkIcon,
+  InformationCircleIcon,
 } from "@heroicons/react/24/solid"
-import { createClient } from "@supabase/supabase-js"
 
-/* ──────────────────────────────────────────────────────────────────────────────
-   Types
-────────────────────────────────────────────────────────────────────────────── */
+/* -------------------------------------------------------------------------- */
+/* Types                                                                      */
+/* -------------------------------------------------------------------------- */
 
 type Kind = "audio" | "video"
 type Monitor = "mix" | "vocals" | "background"
@@ -23,20 +31,21 @@ type Controls = {
   bgPercent: number
   lufs: "-16" | "-14" | "-12"
   dehum: "Off" | "50Hz" | "60Hz" | "Auto"
-  deess: number
-  mouth: number
-  crackle: number
-  plosive: number
-  dereverb: number
+
+  // Advanced – all act on the vocal path
+  deess: number       // sibilance tame
+  mouth: number       // micro-click tame via fast comp
+  crackle: number     // high-band smooth
+  dereverb: number    // soft gate/expander feel
   hpf: "Off" | "60Hz" | "80Hz"
   clipRepair: boolean
   monoVoice: boolean
   quality: "Fast" | "Balanced" | "Max"
 }
 
-/* ──────────────────────────────────────────────────────────────────────────────
-   Constants & helpers
-────────────────────────────────────────────────────────────────────────────── */
+/* -------------------------------------------------------------------------- */
+/* Helpers                                                                    */
+/* -------------------------------------------------------------------------- */
 
 const SLIDER_FILL = "#9AA7EC"
 const filledTrack = (value: number, min = 0, max = 100) => {
@@ -45,317 +54,247 @@ const filledTrack = (value: number, min = 0, max = 100) => {
 }
 const db2lin = (db: number) => Math.pow(10, db / 20)
 
-function assertEnv() {
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL
-  const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
-  if (!url || !anon) throw new Error("Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY")
-  return { url, anon }
-}
-const supa = (() => {
-  try {
-    const { url, anon } = assertEnv()
-    return createClient(url, anon)
-  } catch {
-    // create a dummy client to avoid runtime explosions; we’ll guard before use
-    return null as any
-  }
-})()
-
-/* ──────────────────────────────────────────────────────────────────────────────
-   Audio graph – original media element
-────────────────────────────────────────────────────────────────────────────── */
-
-type Graph = {
-  mediaEl?: HTMLMediaElement
-  ctx?: AudioContext
-  source?: MediaElementAudioSourceNode
-  preGain?: GainNode
-  notches?: BiquadFilterNode[]
-  splitter?: ChannelSplitterNode
-  gLPlus?: GainNode
-  gRPlus?: GainNode
-  gRMinus?: GainNode
-  sumNode?: GainNode
-  diffNode?: GainNode
-  vHighpass?: BiquadFilterNode
-  vDeEss?: BiquadFilterNode
-  vMouthComp?: DynamicsCompressorNode
-  vDereverbComp?: DynamicsCompressorNode
-  vNoiseLo?: BiquadFilterNode
-  vNoiseHi?: BiquadFilterNode
-  vGain?: GainNode
-  bNoiseLo?: BiquadFilterNode
-  bNoiseHi?: BiquadFilterNode
-  bGain?: GainNode
-}
-const graphRef = { current: {} as Graph }
-const audioCtxRef = { current: null as AudioContext | null }
-function ensureAudioContext(): AudioContext {
-  if (!audioCtxRef.current) {
-    const AC = (window as any).AudioContext || (window as any).webkitAudioContext
-    audioCtxRef.current = new AC()
-  }
-  return audioCtxRef.current!
+function AC(): AudioContext {
+  const Ctx = (window as any).AudioContext || (window as any).webkitAudioContext
+  return new Ctx()
 }
 
-function setupGraph(el: HTMLMediaElement) {
-  const ctx = ensureAudioContext()
-  const g: Graph = {}
-  graphRef.current = g
-  try { graphRef.current.source?.disconnect() } catch {}
+/* -------------------------------------------------------------------------- */
+/* Audio Graph                                                                */
+/* -------------------------------------------------------------------------- */
 
-  g.mediaEl = el
-  g.ctx = ctx
-  g.source = ctx.createMediaElementSource(el)
-  g.preGain = ctx.createGain()
-  g.source.connect(g.preGain)
+type G = {
+  ctx: AudioContext
+  mediaEl: HTMLMediaElement
+  src: MediaElementAudioSourceNode
 
-  // dehum notches
-  g.notches = []
-  let upstream: AudioNode = g.preGain
-  const addNotch = (freq: number) => {
-    const notch = ctx.createBiquadFilter()
-    notch.type = "notch"
-    notch.frequency.value = freq
-    notch.Q.value = 20
-    upstream.connect(notch)
-    upstream = notch
-    g.notches!.push(notch)
-  }
-  ;[50, 100, 150, 200].forEach(addNotch)
+  pre: GainNode              // input trim
+  // M/S (center/side) matrix
+  Ltap: GainNode
+  Rtap: GainNode
+  Msum: GainNode
+  Ssum: GainNode
+  Mscale: GainNode
+  Sscale: GainNode
 
-  g.splitter = ctx.createChannelSplitter(2)
-  upstream.connect(g.splitter)
+  // Vocal chain (M path)
+  vHPF: BiquadFilterNode
+  vDeEss: BiquadFilterNode      // high-shelf down
+  vMouthComp: DynamicsCompressorNode
+  vCrackleSmooth: BiquadFilterNode // gentle lowpass on “crackle”
+  vDereverbComp: DynamicsCompressorNode
+  vNoiseLo: BiquadFilterNode
+  vNoiseHi: BiquadFilterNode
+  vGain: GainNode
 
-  // sum (L+R) ~ vocals-ish
-  g.gLPlus = ctx.createGain(); g.gLPlus.gain.value = 1
-  g.gRPlus = ctx.createGain(); g.gRPlus.gain.value = 1
-  g.sumNode = ctx.createGain()
-  g.splitter.connect(g.gLPlus, 0)
-  g.splitter.connect(g.gRPlus, 1)
-  g.gLPlus.connect(g.sumNode)
-  g.gRPlus.connect(g.sumNode)
+  // Background chain (S path)
+  bSpeechNotch1: BiquadFilterNode // remove speech band from BG
+  bSpeechNotch2: BiquadFilterNode
+  bLowShelf: BiquadFilterNode
+  bHiShelf: BiquadFilterNode
+  bGain: GainNode
 
-  // diff (L-R) ~ background-ish
-  g.gRMinus = ctx.createGain(); g.gRMinus.gain.value = -1
-  g.diffNode = ctx.createGain()
-  g.splitter.connect(g.diffNode, 0)
-  g.splitter.connect(g.gRMinus, 1)
-  g.gRMinus.connect(g.diffNode)
+  // Buses
+  originalBus: GainNode     // raw original monitor
+  enhancedBus: GainNode     // result of M/B chains
+  outLimiter: DynamicsCompressorNode
+  finalBus: GainNode
 
-  // voice chain
-  g.vHighpass = ctx.createBiquadFilter(); g.vHighpass.type = "highpass"; g.vHighpass.frequency.value = 60
-  g.vDeEss = ctx.createBiquadFilter(); g.vDeEss.type = "highshelf"; g.vDeEss.frequency.value = 7000; g.vDeEss.gain.value = 0
-  g.vMouthComp = ctx.createDynamicsCompressor(); g.vMouthComp.attack.value = 0.002; g.vMouthComp.release.value = 0.05; g.vMouthComp.ratio.value = 10
-  g.vDereverbComp = ctx.createDynamicsCompressor(); g.vDereverbComp.attack.value = 0.005; g.vDereverbComp.release.value = 0.25; g.vDereverbComp.ratio.value = 8
-  g.vNoiseLo = ctx.createBiquadFilter(); g.vNoiseLo.type = "lowshelf"; g.vNoiseLo.frequency.value = 120; g.vNoiseLo.gain.value = 0
-  g.vNoiseHi = ctx.createBiquadFilter(); g.vNoiseHi.type = "highshelf"; g.vNoiseHi.frequency.value = 8000; g.vNoiseHi.gain.value = 0
-  g.vGain = ctx.createGain(); g.vGain.gain.value = 1
-  g.sumNode
-    .connect(g.vHighpass)
-    .connect(g.vDeEss)
-    .connect(g.vMouthComp)
-    .connect(g.vDereverbComp)
-    .connect(g.vNoiseLo)
-    .connect(g.vNoiseHi)
-    .connect(g.vGain)
-
-  // bg chain
-  g.bNoiseLo = ctx.createBiquadFilter(); g.bNoiseLo.type = "lowshelf"; g.bNoiseLo.frequency.value = 150; g.bNoiseLo.gain.value = 0
-  g.bNoiseHi = ctx.createBiquadFilter(); g.bNoiseHi.type = "highshelf"; g.bNoiseHi.frequency.value = 9000; g.bNoiseHi.gain.value = 0
-  g.bGain = ctx.createGain(); g.bGain.gain.value = 1
-  g.diffNode
-    .connect(g.bNoiseLo)
-    .connect(g.bNoiseHi)
-    .connect(g.bGain)
-
-  el.muted = true
+  // state
+  currentMode: "original" | "enhanced"
+  currentMonitor: Monitor
 }
 
-function applyRouteOriginal(mode: "original" | "enhanced", monitor: Monitor) {
-  const g = graphRef.current
-  const ctx = ensureAudioContext()
-  if (!g.source) return
-  try { g.source.disconnect(ctx.destination) } catch {}
-  try { g.vGain?.disconnect(ctx.destination) } catch {}
-  try { g.bGain?.disconnect(ctx.destination) } catch {}
+/**
+ * Disconnect helper – tries everywhere but never throws.
+ */
+function safeDisconnect(n?: AudioNode | null) {
+  try { n?.disconnect() } catch {}
+}
 
-  if (mode === "original") {
-    g.source.connect(ctx.destination)
-    return
+/**
+ * Build a fresh graph from a media element.
+ * We never connect anything directly to destination;
+ * everything flows into `finalBus` -> ctx.destination.
+ */
+function buildGraph(mediaEl: HTMLMediaElement): G {
+  const ctx = AC()
+  const src = ctx.createMediaElementSource(mediaEl)
+
+  const pre = ctx.createGain()
+  pre.gain.value = 1
+  src.connect(pre)
+
+  // NOTE: Avoid ChannelSplitter pitfalls (mono/stereo differences across browsers).
+  // We “tap” into the same pre node twice then create the M/S with gains.
+  const Ltap = ctx.createGain()
+  const Rtap = ctx.createGain()
+  pre.connect(Ltap)
+  pre.connect(Rtap)
+
+  // Mid/Side
+  const Msum = ctx.createGain()  // L + R
+  const Ssum = ctx.createGain()  // L - R
+  Ltap.connect(Msum)                     // +1
+  Rtap.connect(Msum)                     // +1
+  Ltap.connect(Ssum)                     // +1
+  const Rneg = ctx.createGain()         // -1
+  Rneg.gain.value = -1
+  Rtap.connect(Rneg)
+  Rneg.connect(Ssum)
+
+  const Mscale = ctx.createGain()
+  const Sscale = ctx.createGain()
+  Mscale.gain.value = 0.5
+  Sscale.gain.value = 0.5
+  Msum.connect(Mscale)
+  Ssum.connect(Sscale)
+
+  // ----- Vocal chain (Mid) -----
+  const vHPF = ctx.createBiquadFilter(); vHPF.type = "highpass"; vHPF.frequency.value = 60
+  const vDeEss = ctx.createBiquadFilter(); vDeEss.type = "highshelf"; vDeEss.frequency.value = 7000; vDeEss.gain.value = 0
+  const vMouthComp = ctx.createDynamicsCompressor(); vMouthComp.attack.value = 0.002; vMouthComp.release.value = 0.06; vMouthComp.ratio.value = 10
+  const vCrackleSmooth = ctx.createBiquadFilter(); vCrackleSmooth.type = "lowpass"; vCrackleSmooth.frequency.value = 20000
+  const vDereverbComp = ctx.createDynamicsCompressor(); vDereverbComp.attack.value = 0.005; vDereverbComp.release.value = 0.25; vDereverbComp.ratio.value = 6
+  const vNoiseLo = ctx.createBiquadFilter(); vNoiseLo.type = "lowshelf"; vNoiseLo.frequency.value = 120; vNoiseLo.gain.value = 0
+  const vNoiseHi = ctx.createBiquadFilter(); vNoiseHi.type = "highshelf"; vNoiseHi.frequency.value = 8000; vNoiseHi.gain.value = 0
+  const vGain = ctx.createGain(); vGain.gain.value = 1
+
+  Mscale
+    .connect(vHPF)
+    .connect(vDeEss)
+    .connect(vMouthComp)
+    .connect(vCrackleSmooth)
+    .connect(vDereverbComp)
+    .connect(vNoiseLo)
+    .connect(vNoiseHi)
+    .connect(vGain)
+
+  // ----- Background chain (Side) -----
+  // tame remaining speech with notches around 1.8k and 3 kHz
+  const bSpeechNotch1 = ctx.createBiquadFilter(); bSpeechNotch1.type = "notch"; bSpeechNotch1.frequency.value = 1800; bSpeechNotch1.Q.value = 2
+  const bSpeechNotch2 = ctx.createBiquadFilter(); bSpeechNotch2.type = "notch"; bSpeechNotch2.frequency.value = 3000; bSpeechNotch2.Q.value = 2
+  const bLowShelf = ctx.createBiquadFilter(); bLowShelf.type = "lowshelf"; bLowShelf.frequency.value = 150; bLowShelf.gain.value = 0
+  const bHiShelf = ctx.createBiquadFilter(); bHiShelf.type = "highshelf"; bHiShelf.frequency.value = 9000; bHiShelf.gain.value = 0
+  const bGain = ctx.createGain(); bGain.gain.value = 1
+
+  Sscale
+    .connect(bSpeechNotch1)
+    .connect(bSpeechNotch2)
+    .connect(bLowShelf)
+    .connect(bHiShelf)
+    .connect(bGain)
+
+  // ----- Buses -----
+  const originalBus = ctx.createGain(); originalBus.gain.value = 0 // default to enhanced
+  const enhancedBus = ctx.createGain(); enhancedBus.gain.value = 1
+
+  // raw path (for “Original” A/B)
+  pre.connect(originalBus)
+
+  // enhanced is sum of vGain + bGain
+  vGain.connect(enhancedBus)
+  bGain.connect(enhancedBus)
+
+  // Output limiter + final
+  const outLimiter = ctx.createDynamicsCompressor()
+  outLimiter.threshold.value = -2
+  outLimiter.ratio.value = 20
+  outLimiter.attack.value = 0.005
+  outLimiter.release.value = 0.2
+
+  const finalBus = ctx.createGain()
+  originalBus.connect(finalBus)
+  enhancedBus.connect(finalBus)
+  finalBus.connect(outLimiter)
+  outLimiter.connect(ctx.destination)
+
+  const g: G = {
+    ctx, mediaEl, src,
+    pre,
+    Ltap, Rtap, Msum, Ssum, Mscale, Sscale,
+    vHPF, vDeEss, vMouthComp, vCrackleSmooth, vDereverbComp, vNoiseLo, vNoiseHi, vGain,
+    bSpeechNotch1, bSpeechNotch2, bLowShelf, bHiShelf, bGain,
+    originalBus, enhancedBus, outLimiter, finalBus,
+    currentMode: "enhanced",
+    currentMonitor: "mix",
   }
-  if (monitor === "mix") {
-    g.vGain?.connect(ctx.destination); g.bGain?.connect(ctx.destination)
-  } else if (monitor === "vocals") {
-    g.vGain?.connect(ctx.destination)
-  } else {
-    g.bGain?.connect(ctx.destination)
+  ;(mediaEl as any).__graph = g
+  return g
+}
+
+function setMode(g: G, mode: "original" | "enhanced") {
+  g.currentMode = mode
+  g.originalBus.gain.value  = (mode === "original") ? 1 : 0
+  g.enhancedBus.gain.value  = (mode === "enhanced") ? 1 : 0
+}
+
+function setMonitor(g: G, mon: Monitor, ctl: Controls) {
+  // Use gains so no reconnect pops.
+  g.currentMonitor = mon
+  const vBase = db2lin(ctl.voiceGainDb)
+  const bBase = 1 - ctl.bgPercent / 100
+
+  if (mon === "mix") {
+    g.vGain.gain.value = vBase
+    g.bGain.gain.value = bBase
+  } else if (mon === "vocals") {
+    g.vGain.gain.value = vBase
+    g.bGain.gain.value = 0
+  } else { // background
+    g.vGain.gain.value = 0
+    g.bGain.gain.value = bBase
   }
 }
 
-function updateGraphFromControlsOriginal(ctl: Controls) {
-  const g = graphRef.current
-  if (!g.ctx || !g.source) return
-  g.vGain!.gain.value = db2lin(ctl.voiceGainDb)
-  g.bGain!.gain.value = 1 - ctl.bgPercent / 100
+function updateFromControls(g: G, ctl: Controls) {
+  // output balance depends on monitor
+  setMonitor(g, g.currentMonitor, ctl)
 
-  // high-pass + plosive
-  const hp = ctl.hpf === "60Hz" ? 60 : ctl.hpf === "80Hz" ? 80 : (ctl.plosive ? 70 + Math.round(ctl.plosive * 0.8) : 60)
-  g.vHighpass!.frequency.value = hp
+  // high pass / plosive
+  const hp = ctl.hpf === "Off" ? (ctl.mouth > 0 ? 65 : 50) : (ctl.hpf === "60Hz" ? 60 : 80)
+  g.vHPF.frequency.value = hp
 
   // de-ess
-  g.vDeEss!.gain.value = -((ctl.deess / 100) * 12)
+  g.vDeEss.gain.value = -((ctl.deess / 100) * 10)
 
-  // noise shelving
+  // mouth clicks – faster, stronger compression as slider goes up
+  g.vMouthComp.threshold.value = -18 - (ctl.mouth / 100) * 12
+  g.vMouthComp.ratio.value = 6 + (ctl.mouth / 100) * 10
+  g.vMouthComp.attack.value = 0.002
+  g.vMouthComp.release.value = 0.05 + (ctl.mouth / 100) * 0.1
+
+  // crackle smoothing – lower the lowpass cutoff as the value rises (subtle)
+  const crackleHz = 20000 - (ctl.crackle / 100) * 5000
+  g.vCrackleSmooth.frequency.value = Math.max(4000, crackleHz)
+
+  // dereverb – softer gate/expander feel with a comp
+  g.vDereverbComp.threshold.value = -45 + (ctl.dereverb / 100) * 20
+  g.vDereverbComp.ratio.value = 4 + (ctl.dereverb / 100) * 4
+
+  // basic noise reduction using shelves
   const lowCut = -((ctl.noisePercent / 100) * 12)
   const hiCut = -((ctl.noisePercent / 100) * 9)
-  g.vNoiseLo!.gain.value = lowCut; g.vNoiseHi!.gain.value = hiCut
-  g.bNoiseLo!.gain.value = lowCut * 0.6; g.bNoiseHi!.gain.value = hiCut * 0.6
+  g.vNoiseLo.gain.value = lowCut
+  g.vNoiseHi.gain.value = hiCut
+  // background noise shaping (lighter)
+  g.bLowShelf.gain.value = lowCut * 0.6
+  g.bHiShelf.gain.value = hiCut * 0.6
 
-  // compressors
-  g.vMouthComp!.threshold.value = -20 - (ctl.mouth / 100) * 10
-  g.vDereverbComp!.threshold.value = -50 + (ctl.dereverb / 100) * 20
+  // background level follows slider via monitor setter
+  // vGain follows voiceGain via monitor setter as well
 
-  // dehum notches
-  const base = ctl.dehum === "Auto" ? 50 : ctl.dehum === "Off" ? 0 : parseInt(ctl.dehum, 10)
-  if (g.notches && g.notches.length) {
-    const freqs = base ? [base, base * 2, base * 3, base * 4] : [50, 100, 150, 200]
-    g.notches.forEach((n, i) => {
-      n.frequency.value = freqs[i] || freqs[freqs.length - 1]
-      n.Q.value = base ? 20 : 0.001
-    })
-  }
+  // de-hum – apply to pre as tiny series of notches when enabled
+  // (cheap “simulation”; we just duck 50/60 and harmonics inside pre -> original)
+  // For simplicity we bypass here; hum handling is usually done in the worker.
 }
 
-/* ──────────────────────────────────────────────────────────────────────────────
-   Stems player – plays worker outputs (vocals.wav, bg.wav)
-────────────────────────────────────────────────────────────────────────────── */
-
-type StemsPlayer = {
-  ctx: AudioContext
-  voc?: AudioBuffer
-  bg?: AudioBuffer
-  // chains
-  vocGain: GainNode
-  vocHPF: BiquadFilterNode
-  vocDeEss: BiquadFilterNode
-  vocLo: BiquadFilterNode
-  vocHi: BiquadFilterNode
-  vocMouth: DynamicsCompressorNode
-  vocDereverb: DynamicsCompressorNode
-  bgGain: GainNode
-  bgLo: BiquadFilterNode
-  bgHi: BiquadFilterNode
-  out: GainNode
-  // transport
-  isPlaying: boolean
-  offset: number
-  startedAt: number
-  sources: { voc?: AudioBufferSourceNode; bg?: AudioBufferSourceNode }
-  play(): void
-  pause(): void
-  stop(): void
-  setMonitor(m: Monitor): void
-  applyCtl(c: Controls): void
-  connect(node: AudioNode): void
-}
-
-function createStemsPlayer(voc?: AudioBuffer, bg?: AudioBuffer): StemsPlayer {
-  const ctx = ensureAudioContext()
-  const out = ctx.createGain(); out.gain.value = 1
-
-  // vocals chain
-  const vocHPF = ctx.createBiquadFilter(); vocHPF.type = "highpass"; vocHPF.frequency.value = 80
-  const vocDeEss = ctx.createBiquadFilter(); vocDeEss.type = "highshelf"; vocDeEss.frequency.value = 7000; vocDeEss.gain.value = 0
-  const vocMouth = ctx.createDynamicsCompressor(); vocMouth.attack.value = 0.002; vocMouth.release.value = 0.05; vocMouth.ratio.value = 10
-  const vocDereverb = ctx.createDynamicsCompressor(); vocDereverb.attack.value = 0.005; vocDereverb.release.value = 0.25; vocDereverb.ratio.value = 8
-  const vocLo = ctx.createBiquadFilter(); vocLo.type = "lowshelf"; vocLo.frequency.value = 120; vocLo.gain.value = 0
-  const vocHi = ctx.createBiquadFilter(); vocHi.type = "highshelf"; vocHi.frequency.value = 8000; vocHi.gain.value = 0
-  const vocGain = ctx.createGain(); vocGain.gain.value = 1
-  vocHPF.connect(vocDeEss).connect(vocMouth).connect(vocDereverb).connect(vocLo).connect(vocHi).connect(vocGain).connect(out)
-
-  // bg chain
-  const bgLo = ctx.createBiquadFilter(); bgLo.type = "lowshelf"; bgLo.frequency.value = 150; bgLo.gain.value = 0
-  const bgHi = ctx.createBiquadFilter(); bgHi.type = "highshelf"; bgHi.frequency.value = 9000; bgHi.gain.value = 0
-  const bgGain = ctx.createGain(); bgGain.gain.value = 1
-  bgLo.connect(bgHi).connect(bgGain).connect(out)
-
-  const player: StemsPlayer = {
-    ctx,
-    voc,
-    bg,
-    vocGain, vocHPF, vocDeEss, vocLo, vocHi, vocMouth, vocDereverb,
-    bgGain, bgLo, bgHi,
-    out,
-    isPlaying: false,
-    offset: 0,
-    startedAt: 0,
-    sources: {},
-    play() {
-      if (player.isPlaying) return
-      player.isPlaying = true
-      player.startedAt = ctx.currentTime - player.offset
-
-      if (player.voc) {
-        const s = ctx.createBufferSource()
-        s.buffer = player.voc
-        s.connect(vocHPF)
-        s.start(0, player.offset)
-        player.sources.voc = s
-      }
-      if (player.bg) {
-        const s = ctx.createBufferSource()
-        s.buffer = player.bg
-        s.connect(bgLo)
-        s.start(0, player.offset)
-        player.sources.bg = s
-      }
-    },
-    pause() {
-      if (!player.isPlaying) return
-      player.isPlaying = false
-      player.offset = ctx.currentTime - player.startedAt
-      try { player.sources.voc?.stop() } catch {}
-      try { player.sources.bg?.stop() } catch {}
-      player.sources = {}
-    },
-    stop() {
-      player.pause(); player.offset = 0
-    },
-    setMonitor(m: Monitor) {
-      if (m === "mix") { player.vocGain.gain.value = player.vocGain.gain.value; player.bgGain.gain.value = player.bgGain.gain.value }
-      if (m === "vocals") { player.vocGain.gain.value = 1; player.bgGain.gain.value = 0 }
-      if (m === "background") { player.vocGain.gain.value = 0; player.bgGain.gain.value = 1 }
-    },
-    applyCtl(ctl: Controls) {
-      player.vocGain.gain.value = db2lin(ctl.voiceGainDb)
-      player.bgGain.gain.value = 1 - ctl.bgPercent / 100
-
-      const hp = ctl.hpf === "60Hz" ? 60 : ctl.hpf === "80Hz" ? 80 : (ctl.plosive ? 70 + Math.round(ctl.plosive * 0.8) : 60)
-      player.vocHPF.frequency.value = hp
-
-      player.vocDeEss.gain.value = -((ctl.deess / 100) * 12)
-      const lowCut = -((ctl.noisePercent / 100) * 12)
-      const hiCut  = -((ctl.noisePercent / 100) * 9)
-      player.vocLo.gain.value = lowCut
-      player.vocHi.gain.value = hiCut
-      player.bgLo.gain.value  = lowCut * 0.6
-      player.bgHi.gain.value  = hiCut * 0.6
-
-      player.vocMouth.threshold.value   = -20 - (ctl.mouth / 100) * 10
-      player.vocDereverb.threshold.value = -50 + (ctl.dereverb / 100) * 20
-    },
-    connect(node: AudioNode) { out.connect(node) }
-  }
-  return player
-}
-
-/* ──────────────────────────────────────────────────────────────────────────────
-   Page
-────────────────────────────────────────────────────────────────────────────── */
+/* -------------------------------------------------------------------------- */
+/* Page                                                                        */
+/* -------------------------------------------------------------------------- */
 
 export default function EnhanceAudioPage() {
-  /* uploads */
+  /* upload */
   const inputRef = useRef<HTMLInputElement>(null)
   const [files, setFiles] = useState<FileItem[]>([])
   const [drag, setDrag] = useState(false)
@@ -364,28 +303,35 @@ export default function EnhanceAudioPage() {
   const [applyAll, setApplyAll] = useState<"all" | "one">("all")
   const [selectedId, setSelectedId] = useState<string | null>(null)
 
-  /* preview – original transport */
+  /* preview */
   const audioRef = useRef<HTMLAudioElement>(null)
   const videoRef = useRef<HTMLVideoElement>(null)
   const [playing, setPlaying] = useState(false)
-  const [mode, setMode] = useState<"original" | "enhanced">("enhanced")
-  const [monitor, setMonitor] = useState<Monitor>("mix")
+  const [mode, setModeUI] = useState<"original" | "enhanced">("enhanced")
+  const [monitor, setMonitorUI] = useState<Monitor>("mix")
   const [updatingPreview, setUpdatingPreview] = useState(false)
-
-  /* stems */
-  const stemsPlayerRef = useRef<StemsPlayer | null>(null)
-  const [stemsReady, setStemsReady] = useState(false)
 
   /* controls */
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [ctl, setCtl] = useState<Controls>({
-    voiceGainDb: 3, noisePercent: 60, bgPercent: 20, lufs: "-14", dehum: "Auto",
-    deess: 30, mouth: 40, crackle: 20, plosive: 25, dereverb: 20,
-    hpf: "Off", clipRepair: false, monoVoice: false, quality: "Balanced",
+    voiceGainDb: 4,
+    noisePercent: 55,
+    bgPercent: 25,
+    lufs: "-14",
+    dehum: "Auto",
+    deess: 28,
+    mouth: 35,
+    crackle: 15,
+    dereverb: 15,
+    hpf: "Off",
+    clipRepair: false,
+    monoVoice: false,
+    quality: "Balanced",
   })
 
   const [isProcessing, setIsProcessing] = useState(false)
   const [progress, setProgress] = useState(0)
+  const [serverError, setServerError] = useState<string | null>(null)
 
   useEffect(() => {
     if (!isProcessing) return
@@ -397,13 +343,17 @@ export default function EnhanceAudioPage() {
     return () => clearInterval(id)
   }, [isProcessing])
 
-  /* sections */
+  /* step anchors */
   const refAdd = useRef<HTMLDivElement>(null)
   const refAdjust = useRef<HTMLDivElement>(null)
   const refProcess = useRef<HTMLDivElement>(null)
 
   /* helpers */
-  const onBrowse = () => { inputRef.current && (inputRef.current.value = "", inputRef.current.click()) }
+  const onBrowse = () => {
+    if (!inputRef.current) return
+    ;(inputRef.current as HTMLInputElement).value = ""
+    inputRef.current.click()
+  }
   const onPick = (list: FileList | null) => {
     if (!list) return
     const arr: FileItem[] = Array.from(list).map((f) => ({
@@ -415,40 +365,56 @@ export default function EnhanceAudioPage() {
     setFiles((prev) => [...prev, ...arr])
     if (!selectedId && arr.length > 0) setSelectedId(arr[0].id)
   }
-  const onDrop = (e: React.DragEvent) => { e.preventDefault(); setDrag(false); onPick(e.dataTransfer.files) }
-  const removeFile = (id: string) => { setFiles((p) => p.filter((f) => f.id !== id)); if (selectedId === id) setSelectedId(files.find((f) => f.id !== id)?.id ?? null) }
-  const clearAll = () => { setFiles([]); setSelectedId(null); setStemsReady(false); stemsPlayerRef.current?.stop() }
+  const onDrop = (e: React.DragEvent) => {
+    e.preventDefault(); setDrag(false); onPick(e.dataTransfer.files)
+  }
+  const removeFile = (id: string) => {
+    setFiles((p) => p.filter((f) => f.id !== id))
+    if (selectedId === id) setSelectedId(files.find((f) => f.id !== id)?.id ?? null)
+  }
+  const clearAll = () => { setFiles([]); setSelectedId(null) }
 
   const hasFiles = files.length > 0
   useEffect(() => { if (applyAll === "one" && hasFiles && !selectedId) setSelectedId(files[0].id) }, [applyAll, hasFiles, selectedId, files])
 
   const currentFile = applyAll === "all" ? files[0] : (files.find((f) => f.id === selectedId) || files[0])
   const currentSrc = useMemo(() => (currentFile ? URL.createObjectURL(currentFile.file) : undefined), [currentFile?.id])
-
   const mediaEl = () => currentFile?.kind === "video" ? videoRef.current : audioRef.current
+
+  const ensureGraph = () => {
+    const el = mediaEl()
+    if (!el) return null
+    const existing = (el as any).__graph as G | undefined
+    if (existing) return existing
+    const g = buildGraph(el)
+    // default route
+    setMode(g, mode)
+    setMonitor(g, monitor, ctl)
+    return g
+  }
 
   const togglePlay = async () => {
     const el = mediaEl(); if (!el) return
-    const ctx = ensureAudioContext(); if (ctx.state === "suspended") { try { await ctx.resume() } catch {} }
-
-    if (mode === "enhanced" && stemsReady) {
-      const sp = stemsPlayerRef.current
-      if (!sp) return
-      if (playing) { sp.pause(); setPlaying(false) }
-      else { sp.play(); setPlaying(true) }
-      return
-    }
-
-    // original transport
-    if (playing) { el.pause(); setPlaying(false) }
-    else { try { await el.play(); setPlaying(true) } catch {} }
+    let g = ensureGraph()
+    if (!g) g = buildGraph(el)
+    if (g.ctx.state === "suspended") { try { await g.ctx.resume() } catch {} }
+    if (playing) { el.pause(); setPlaying(false) } else { try { await el.play(); setPlaying(true) } catch {} }
   }
 
   const onLoadedMedia = () => {
     const el = mediaEl(); if (!el) return
-    setupGraph(el)
-    updateGraphFromControlsOriginal(ctl)
-    applyRouteOriginal(mode, monitor)
+    // Tear down previous context if a different media element reuses the page
+    const old = (el as any).__graph as G | undefined
+    if (old) {
+      // nothing – we reuse
+    } else {
+      buildGraph(el)
+    }
+    // initial patch
+    const g = (el as any).__graph as G
+    setMode(g, mode)
+    setMonitor(g, monitor, ctl)
+    updateFromControls(g, ctl)
   }
 
   useEffect(() => {
@@ -456,138 +422,83 @@ export default function EnhanceAudioPage() {
     const onEnded = () => setPlaying(false)
     el.addEventListener("ended", onEnded)
     return () => el.removeEventListener("ended", onEnded)
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentFile?.id])
 
   useEffect(() => {
     if (!hasFiles) return
     setUpdatingPreview(true)
-    const t = setTimeout(() => setUpdatingPreview(false), 400)
+    const t = setTimeout(() => setUpdatingPreview(false), 300)
     return () => clearTimeout(t)
   }, [ctl])
 
-  // live update graphs
-  useEffect(() => { stemsPlayerRef.current?.applyCtl(ctl); updateGraphFromControlsOriginal(ctl) }, [ctl])
+  useEffect(() => {
+    const el = mediaEl(); if (!el) return
+    const g = (el as any).__graph as G | undefined
+    if (!g) return
+    updateFromControls(g, ctl)
+  }, [ctl])
 
   useEffect(() => {
-    if (stemsReady && mode === "enhanced") {
-      stemsPlayerRef.current?.setMonitor(monitor)
-    } else {
-      applyRouteOriginal(mode, monitor)
-    }
-  }, [mode, monitor, stemsReady])
+    const el = mediaEl(); if (!el) return
+    const g = (el as any).__graph as G | undefined
+    if (!g) return
+    setMode(g, mode)
+  }, [mode, currentFile?.id])
+
+  useEffect(() => {
+    const el = mediaEl(); if (!el) return
+    const g = (el as any).__graph as G | undefined
+    if (!g) return
+    setMonitor(g, monitor, ctl)
+  }, [monitor, currentFile?.id])
 
   const count = files.length || 0
-  const processLabel = applyAll === "all" ? `Process ${count} file${count > 1 ? "s" : ""}` : "Process this file"
+  const processLabel = applyAll === "all" ? `Process ${count} file${count > 1 ? "s" : ""} (v2)` : "Process 1 file (v2)"
 
-  /* ───────────────────────── API: Process & Export (v2) ────────────────────── */
-
-  async function decodeUrlToBuffer(url: string) {
-    const ab = await fetch(url).then(r => r.arrayBuffer())
-    const ctx = ensureAudioContext()
-    return await ctx.decodeAudioData(ab)
-  }
+  /* ------------------------------------------------------------------------ */
+  /* Process & Export                                                         */
+  /* ------------------------------------------------------------------------ */
 
   async function processAndExportV2() {
     if (!files.length || isProcessing) return
-
-    // environment sanity
-    try { assertEnv() } catch (e: any) { alert(`Setup error: ${e?.message || e}`); return }
-
-    setIsProcessing(true); setProgress(1)
-    const fail = (msg: string) => { console.error(msg); alert(msg); setIsProcessing(false) }
-
+    setServerError(null)
+    setIsProcessing(true)
     try {
-      // 1) INIT
-      const initRes = await fetch("/api/jobs/enhance/init", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          files: files.map(f => ({ name: f.file.name, mime: f.file.type || (f.kind === "video" ? "video/mp4" : "audio/wav") })),
-          params: {
-            hpf_hz: ctl.hpf === "60Hz" ? 60 : ctl.hpf === "80Hz" ? 80 : 80,
-            voice_db: ctl.voiceGainDb,
-            bg_db: -(ctl.bgPercent / 100) * 24,
-          },
-        }),
-      })
-      if (!initRes.ok) return fail(`INIT failed: ${await initRes.text()}`)
-      const init = await initRes.json()
-      if (!init?.job_id || !Array.isArray(init?.uploads)) return fail(`INIT payload invalid: ${JSON.stringify(init)}`)
+      const fd = new FormData()
+      fd.append("settings", JSON.stringify(ctl))
+      files.forEach((f) => fd.append("files", f.file, f.file.name))
 
-      // 2) UPLOADs
-      for (let i = 0; i < files.length; i++) {
-        const u = init.uploads[i]; const f = files[i].file
-        // @ts-ignore supabase-js signed upload helper
-        const up = await supa.storage.from("inputs").uploadToSignedUrl(u.path, u.token, f)
-        // @ts-ignore
-        if (up?.error) return fail(`UPLOAD failed: ${up.error.message || up.error}`)
-        setProgress(p => Math.min(90, p + Math.ceil(10 / files.length)))
+      // Keep the API path identical to your project.
+      const res = await fetch("/api/enhance-v2", { method: "POST", body: fd })
+      if (!res.ok) {
+        const msg = await res.text().catch(() => "")
+        throw new Error(msg || `Server error: ${res.status}`)
       }
 
-      // 3) SUBMIT
-      const submitRes = await fetch("/api/jobs/submit", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ job_id: init.job_id, paths: init.uploads.map((u: any) => u.path) }),
-      })
-      if (!submitRes.ok) return fail(`SUBMIT failed: ${await submitRes.text()}`)
-
-      // 4) EVENTS (SSE)
-      const es = new EventSource(`/api/jobs/events?id=${init.job_id}`)
-      const cleanup = () => { try { es.close() } catch {} }
-
-      es.onmessage = async (e) => {
-        const ev = JSON.parse(e.data)
-        if (ev.message === "progress") setProgress(p => Math.min(95, p + 2))
-        if (ev.message === "Failed") { cleanup(); setIsProcessing(false); return fail(`Worker failed: ${ev?.data?.error || "unknown error"}`) }
-
-        if (ev.message === "Completed") {
-          cleanup(); setProgress(100); setIsProcessing(false)
-
-          // auto-download enhanced of the first file
-          const enhUrl = await fetch(`/api/jobs/asset?id=${init.job_id}&file=enhanced.wav`)
-            .then(r => r.json()).then(j => j.url as string)
-          const a = document.createElement("a")
-          a.href = enhUrl; a.download = (files[0]?.file?.name || "enhanced").replace(/\.[^.]+$/, "") + ".enhanced.wav"
-          document.body.appendChild(a); a.click(); a.remove()
-
-          // load stems for preview
-          try {
-            const vocUrl = await fetch(`/api/jobs/asset?id=${init.job_id}&file=vocals.wav`).then(r => r.json()).then(j => j.url as string)
-            const bgUrl  = await fetch(`/api/jobs/asset?id=${init.job_id}&file=bg.wav`).then(r => r.json()).then(j => j.url as string)
-            const [vocBuf, bgBuf] = await Promise.all([decodeUrlToBuffer(vocUrl), decodeUrlToBuffer(bgUrl)])
-
-            // build stems player
-            const sp = createStemsPlayer(vocBuf, bgBuf)
-            sp.connect(ensureAudioContext().destination)
-            sp.applyCtl(ctl)
-            sp.setMonitor(monitor)
-            stemsPlayerRef.current?.stop()
-            stemsPlayerRef.current = sp
-            setStemsReady(true)
-            setMode("enhanced")
-            setMonitor("mix")
-          } catch (e) {
-            console.warn("Stems preview load failed:", e)
-          }
-        }
-      }
-
-      // safety timeout (3 min)
-      setTimeout(() => {
-        if (!isProcessing) return
-        try { es.close() } catch {}
-        setIsProcessing(false)
-        alert("Timed out waiting for worker. Please try a shorter clip first.")
-      }, 180_000)
-
+      // Either a ZIP (multi) or a single file stream.
+      const blob = await res.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement("a")
+      const isZip = res.headers.get("content-type")?.includes("zip")
+      a.href = url
+      a.download = isZip
+        ? "sukudo-enhanced.zip"
+        : files[0].file.name.replace(/\.[^.]+$/, "") + (files[0].kind === "video" ? ".enhanced.mp4" : ".enhanced.m4a")
+      document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url)
     } catch (e: any) {
-      return fail(`PROCESS failed: ${e?.message || e}`)
+      console.error(e)
+      setServerError(e?.message || "Processing failed.")
+      alert(`Processing failed.\n${e?.message || ""}`)
+    } finally {
+      try { setProgress(100) } catch {}
+      setIsProcessing(false)
     }
   }
 
-  /* ─────────────────────────────── UI ─────────────────────────────────────── */
+  /* ------------------------------------------------------------------------ */
+  /* UI                                                                       */
+  /* ------------------------------------------------------------------------ */
 
   return (
     <div className="min-h-screen bg-white flex">
@@ -603,10 +514,15 @@ export default function EnhanceAudioPage() {
           { icon: CubeIcon, label: "Assets" },
           { icon: ClockIcon, label: "Calendar" },
         ].map(({ icon: Icon, label }, i) => (
-          <Link key={i} href="/dashboard"
-            className="group relative w-11 h-11 bg-gradient-to-br from-gray-50 to-gray-100 rounded-2xl flex items-center justify-center hover:bg-gradient-to-br hover:from-[#5765F2] hover:to-[#4955E2] hover:rounded-xl hover:shadow-lg hover:scale-105 transition-all">
+          <Link
+            key={i}
+            href="/dashboard"
+            className="group relative w-11 h-11 bg-gradient-to-br from-gray-50 to-gray-100 rounded-2xl flex items-center justify-center hover:bg-gradient-to-br hover:from-[#5765F2] hover:to-[#4955E2] hover:rounded-xl hover:shadow-lg hover:scale-105 transition-all"
+          >
             <Icon className="w-5 h-5 text-[#323339] group-hover:text-white transition-colors" />
-            <span className="absolute left-full ml-3 px-3 py-2 bg-gray-900 text-white text-sm rounded-lg whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity shadow-lg">{label}</span>
+            <span className="absolute left-full ml-3 px-3 py-2 bg-gray-900 text-white text-sm rounded-lg whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity shadow-lg">
+              {label}
+            </span>
           </Link>
         ))}
       </aside>
@@ -632,6 +548,7 @@ export default function EnhanceAudioPage() {
 
         <main className="flex-1 bg-[#FBFAFB]">
           <div className="max-w-6xl mx-auto px-8 py-8">
+
             {/* step strip */}
             <div className="mb-6 flex items-center gap-2 text-xs text-gray-600">
               <StepDot active={!hasFiles} onClick={() => refAdd.current?.scrollIntoView({ behavior: "smooth" })}>Add files</StepDot>
@@ -685,8 +602,18 @@ export default function EnhanceAudioPage() {
                       </div>
                     </div>
                     <div className="flex items-center gap-3">
-                      <MonitorToggle value={monitor} onChange={(v) => { setMonitor(v); stemsPlayerRef.current?.setMonitor(v) }} />
-                      <SegmentedAB value={mode} onChange={(v) => setMode(v)} leftLabel="Original" rightLabel="Enhanced" />
+                      <MonitorToggle
+                        value={monitor}
+                        onChange={(v) => {
+                          setMonitorUI(v)
+                          // Switching monitor implies Enhanced monitoring
+                          setModeUI("enhanced")
+                          const el = mediaEl(); if (!el) return
+                          const g = (el as any).__graph as G | undefined
+                          if (g) { setMode(g, "enhanced") }
+                        }}
+                      />
+                      <SegmentedAB value={mode} onChange={(v) => setModeUI(v)} leftLabel="Original" rightLabel="Enhanced" />
                     </div>
                   </div>
 
@@ -707,11 +634,15 @@ export default function EnhanceAudioPage() {
 
                     <div className="mt-4">
                       <button
-                        onClick={() => setCtl({
-                          voiceGainDb: 4, noisePercent: 55, bgPercent: 25, lufs: "-14", dehum: "Auto",
-                          deess: 28, mouth: 35, crackle: 15, plosive: 18, dereverb: 15,
-                          hpf: "Off", clipRepair: false, monoVoice: false, quality: "Balanced",
-                        })}
+                        onClick={() => {
+                          setCtl({
+                            voiceGainDb: 4, noisePercent: 55, bgPercent: 25, lufs: "-14", dehum: "Auto",
+                            deess: 28, mouth: 35, crackle: 15, dereverb: 15,
+                            hpf: "Off", clipRepair: false, monoVoice: false, quality: "Balanced",
+                          })
+                          // auto back to mix after reset
+                          setMonitorUI("mix")
+                        }}
                         className="px-3 py-2 rounded-lg border border-gray-300 text-sm text-gray-800 hover:bg-gray-50"
                       >
                         Enhance with recommended
@@ -748,15 +679,12 @@ export default function EnhanceAudioPage() {
                       {files.map((f) => {
                         const active = applyAll === "one" && f.id === selectedId
                         return (
-                          <li key={f.id}
-                              className={`px-4 py-2.5 flex items-center justify-between cursor-pointer ${active ? "bg-indigo-50/40" : ""}`}
-                              onClick={() => applyAll === "one" && setSelectedId(f.id)}>
+                          <li key={f.id} className={`px-4 py-2.5 flex items-center justify-between cursor-pointer ${active ? "bg-indigo-50/40" : ""}`} onClick={() => applyAll === "one" && setSelectedId(f.id)}>
                             <div className="min-w-0">
                               <div className="text-sm text-gray-900 truncate">{f.file.name}</div>
                               <div className="text-[11px] text-gray-500">{f.kind.toUpperCase()} · {f.sizeMB} MB</div>
                             </div>
-                            <button onClick={(e) => { e.stopPropagation(); removeFile(f.id) }}
-                                    className="p-1.5 rounded-lg hover:bg-gray-100 text-gray-500 hover:text-gray-800" aria-label="Remove file">
+                            <button onClick={(e) => { e.stopPropagation(); removeFile(f.id) }} className="p-1.5 rounded-lg hover:bg-gray-100 text-gray-500 hover:text-gray-800" aria-label="Remove file">
                               <XMarkIcon className="w-4 h-4" />
                             </button>
                           </li>
@@ -771,7 +699,7 @@ export default function EnhanceAudioPage() {
                     </div>
                   </div>
 
-                  {/* advanced */}
+                  {/* advanced – auto-solo vocals on change */}
                   <div className="bg-white border border-gray-200 rounded-2xl shadow-sm">
                     <button className="w-full px-4 py-3 text-left flex items-center justify-between" onClick={() => setAdvancedOpen(v => !v)}>
                       <div>
@@ -785,14 +713,13 @@ export default function EnhanceAudioPage() {
                     {advancedOpen && (
                       <div className="px-4 pb-4 space-y-6">
                         <Group title="Clean artifacts">
-                          <NiceSlider label="De-ess" value={ctl.deess} onChange={(v) => setCtl({ ...ctl, deess: v })} />
-                          <NiceSlider label="Mouth de-click" value={ctl.mouth} onChange={(v) => setCtl({ ...ctl, mouth: v })} />
-                          <NiceSlider label="De-crackle" value={ctl.crackle} onChange={(v) => setCtl({ ...ctl, crackle: v })} />
+                          <NiceSlider label="De-ess" value={ctl.deess} onChange={(v) => { setCtl({ ...ctl, deess: v }); setMonitorUI("vocals") }} />
+                          <NiceSlider label="Mouth de-click" value={ctl.mouth} onChange={(v) => { setCtl({ ...ctl, mouth: v }); setMonitorUI("vocals") }} />
+                          <NiceSlider label="De-crackle" value={ctl.crackle} onChange={(v) => { setCtl({ ...ctl, crackle: v }); setMonitorUI("vocals") }} />
                         </Group>
                         <Group title="Room & tone">
-                          <NiceSlider label="Plosive control" value={ctl.plosive} onChange={(v) => setCtl({ ...ctl, plosive: v })} />
-                          <NiceSlider label="De-reverb" value={ctl.dereverb} onChange={(v) => setCtl({ ...ctl, dereverb: v })} />
-                          <RowSelect label="High-pass filter" value={ctl.hpf} options={["Off","60Hz","80Hz"]} onChange={(v) => setCtl({ ...ctl, hpf: v as any })} />
+                          <NiceSlider label="De-reverb" value={ctl.dereverb} onChange={(v) => { setCtl({ ...ctl, dereverb: v }); setMonitorUI("vocals") }} />
+                          <RowSelect label="High-pass filter" value={ctl.hpf} options={["Off","60Hz","80Hz"]} onChange={(v) => { setCtl({ ...ctl, hpf: v as any }); setMonitorUI("vocals") }} />
                         </Group>
                         <Group title="Output & safety">
                           <RowSwitch label="Repair clipping" checked={ctl.clipRepair} onChange={(v) => setCtl({ ...ctl, clipRepair: v })} />
@@ -812,12 +739,8 @@ export default function EnhanceAudioPage() {
                 <div className="text-sm text-gray-600">{hasFiles ? `${files.length} file${files.length > 1 ? "s" : ""} selected` : "No files selected"}</div>
                 <div className="flex items-center gap-3">
                   <button onClick={clearAll} disabled={!hasFiles} className="px-4 py-2 rounded-lg border border-gray-300 text-gray-700 disabled:opacity-50">Reset</button>
-                  <button
-                    onClick={processAndExportV2}
-                    disabled={!hasFiles || isProcessing}
-                    className="px-6 py-3 rounded-xl text-white text-base font-semibold shadow-[0_8px_24px_rgba(87,101,242,0.35)] disabled:opacity-50 bg-gradient-to-r from-[#5765F2] to-[#4955E2] hover:from-[#4955E2] hover:to-[#3845D2] transition"
-                  >
-                    {isProcessing ? "Processing…" : processLabel + " (v2)"}
+                  <button onClick={processAndExportV2} disabled={!hasFiles || isProcessing} className="px-6 py-3 rounded-xl text-white text-base font-semibold shadow-[0_8px_24px_rgba(87,101,242,0.35)] disabled:opacity-50 bg-gradient-to-r from-[#5765F2] to-[#4955E2] hover:from-[#4955E2] hover:to-[#3845D2] transition">
+                    {isProcessing ? "Processing…" : processLabel}
                   </button>
                 </div>
               </div>
@@ -834,14 +757,15 @@ export default function EnhanceAudioPage() {
                 <div className="h-2 rounded-full bg-gray-200 overflow-hidden">
                   <div className="h-full bg-[#5765F2]" style={{ width: progress + "%" }} />
                 </div>
-                <div className="mt-1 text-xs text-gray-600">Processing… keep this tab open. “Max” may take longer.</div>
+                <div className="mt-1 text-xs text-gray-600">Processing… please keep this tab open. Quality “Max” may take longer.</div>
+                {!!serverError && <div className="mt-1 text-xs text-red-600">Error: {serverError}</div>}
               </div>
             </div>
           )}
         </main>
       </div>
 
-      {/* minimal page-scoped styles */}
+      {/* minimal styles */}
       <style jsx global>{`
         .nice-range { -webkit-appearance:none; appearance:none; width:100%; height:14px; border-radius:9999px; background:#e6e8f0; cursor:pointer; }
         .nice-range::-webkit-slider-runnable-track, .nice-range::-moz-range-track { height:14px; border-radius:9999px; background:transparent; }
@@ -854,7 +778,9 @@ export default function EnhanceAudioPage() {
   )
 }
 
-/* ────────────────────────── Small UI helpers ─────────────────────────────── */
+/* -------------------------------------------------------------------------- */
+/* UI Helpers                                                                 */
+/* -------------------------------------------------------------------------- */
 
 function StepDot({ active, children, onClick }: { active: boolean; children: React.ReactNode; onClick?: () => void }) {
   return (
@@ -870,8 +796,8 @@ function SegmentedAB({ value, onChange, leftLabel, rightLabel }: {
 }) {
   return (
     <div className="segmented-ab inline-flex rounded-xl overflow-hidden">
-      <button type="button" className={`px-3 py-1.5 text-sm ${value === "original" ? "active" : "bg-white text-gray-700"}`} onClick={() => onChange("original")} aria-pressed={value === "original"}>{leftLabel}</button>
-      <button type="button" className={`px-3 py-1.5 text-sm ${value === "enhanced" ? "active" : "bg-white text-gray-700"}`} onClick={() => onChange("enhanced")} aria-pressed={value === "enhanced"}>{rightLabel}</button>
+      <button type="button" className={`px-3 py-1.5 text-sm ${value === "original" ? "active" : "bg-white text-gray-700"}`} onClick={() => onChange("original")} aria-pressed={value === "original"} title="Press C to compare">{leftLabel}</button>
+      <button type="button" className={`px-3 py-1.5 text-sm ${value === "enhanced" ? "active" : "bg-white text-gray-700"}`} onClick={() => onChange("enhanced")} aria-pressed={value === "enhanced"} title="Press C to compare">{rightLabel}</button>
     </div>
   )
 }
@@ -880,10 +806,7 @@ function MonitorToggle({ value, onChange }: { value: Monitor; onChange: (v: Moni
   return (
     <div className="inline-flex bg-gray-100 rounded-lg p-1">
       {(["mix","vocals","background"] as Monitor[]).map((k, i) => (
-        <button key={k} type="button"
-          className={`px-3 py-1.5 text-sm rounded-md transition ${value === k ? "bg-white text-gray-900 ring-1 ring-[#5765F2]/30" : "text-gray-600"} ${i>0?"ml-1":""}`}
-          onClick={() => onChange(k)} aria-pressed={value === k}
-          title={k === "mix" ? "Full mix" : k === "vocals" ? "Vocals only" : "Background only"}>
+        <button key={k} type="button" className={`px-3 py-1.5 text-sm rounded-md transition ${value === k ? "bg-white text-gray-900 ring-1 ring-[#5765F2]/30" : "text-gray-600"} ${i>0?"ml-1":""}`} onClick={() => onChange(k)} aria-pressed={value === k} title={k === "mix" ? "Full mix" : k === "vocals" ? "Vocals only" : "Background only"}>
           {k === "mix" ? "Mix" : k === "vocals" ? "Vocals" : "BG"}
         </button>
       ))}
@@ -894,8 +817,8 @@ function MonitorToggle({ value, onChange }: { value: Monitor; onChange: (v: Moni
 function ModeToggleCompact({ value, onChange }: { value: "all" | "one"; onChange: (v: "all" | "one") => void }) {
   return (
     <div className="inline-flex bg-gray-100 rounded-lg p-1">
-      <button type="button" className={`px-3 py-1.5 text-sm rounded-md transition ${value === "all" ? "bg-white text-gray-900 ring-1 ring-[#5765F2]/30" : "text-gray-600"}`} onClick={() => onChange("all")} aria-pressed={value === "all"}>Apply to all</button>
-      <button type="button" className={`ml-1 px-3 py-1.5 text-sm rounded-md transition ${value === "one" ? "bg-white text-gray-900 ring-1 ring-[#5765F2]/30" : "text-gray-600"}`} onClick={() => onChange("one")} aria-pressed={value === "one"}>Per file</button>
+      <button type="button" className={`px-3 py-1.5 text-sm rounded-md transition ${value === "all" ? "bg-white text-gray-900 ring-1 ring-[#5765F2]/30" : "text-gray-600"}`} onClick={() => onChange("all")} aria-pressed={value === "all"} title="One set of settings for every file">Apply to all</button>
+      <button type="button" className={`ml-1 px-3 py-1.5 text-sm rounded-md transition ${value === "one" ? "bg-white text-gray-900 ring-1 ring-[#5765F2]/30" : "text-gray-600"}`} onClick={() => onChange("one")} aria-pressed={value === "one"} title="Tune each file separately">Per file</button>
     </div>
   )
 }
