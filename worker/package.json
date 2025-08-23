@@ -9,9 +9,11 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.43.1",
+    "ffmpeg-static": "^5.2.0",
     "node-fetch": "^3.3.2"
   }
 }
+<<<<<<< Updated upstream
 
 {
   "name": "mvp-worker",
@@ -26,3 +28,5 @@
     "ffmpeg-static": "^5.2.0"
   }
 }
+=======
+>>>>>>> Stashed changes
