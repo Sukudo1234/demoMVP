@@ -389,64 +389,86 @@ export default function EnhanceAudioPage() {
 
   /* -------------------------- JOBS: Process & Export -------------------------- */
   async function processAndExport() {
-    if (!files.length || isProcessing) return
-    setIsProcessing(true); setProgress(1)
-    try {
-      // 1) init job
-      const init = await fetch("/api/jobs/enhance/init", {
-        method:"POST",
-        headers:{ "Content-Type":"application/json" },
-        body:JSON.stringify({
-          files: files.map(f=>({ name: f.file.name, mime: f.file.type || (f.kind==="video" ? "video/mp4" : "audio/wav") })),
-          params: {
-            hpf_hz:  ctl.hpf === "60Hz" ? 60 : ctl.hpf === "80Hz" ? 80 : 80,
-            denoise_nf: -25,
-            voice_db: ctl.voiceGainDb,
-            bg_db: -(ctl.bgPercent/100)*24
-          }
-        })
-      }).then(r=>r.json())
-      if (!init?.job_id) throw new Error("init failed")
-      setJobId(init.job_id)
+  if (!files.length || isProcessing) return
+  setIsProcessing(true); setProgress(1)
 
-      // 2) upload to inputs/
-      for (let i=0;i<files.length;i++){
-        const u = init.uploads[i], f = files[i].file
-        // @ts-ignore
-        const up = await supa.storage.from("inputs").uploadToSignedUrl(u.path, u.token, f)
-        // @ts-ignore
-        if (up.error) throw new Error(up.error.message)
-      }
+  // helper to bail with a readable message
+  const fail = (msg: string) => { console.error(msg); alert(msg); setIsProcessing(false) }
 
-      // 3) submit
-      await fetch("/api/jobs/submit",{
-        method:"POST", headers:{ "Content-Type":"application/json" },
-        body:JSON.stringify({ job_id:init.job_id, paths:init.uploads.map((u:any)=>u.path) })
+  try {
+    // 1) INIT — ask server for signed upload URLs
+    const initRes = await fetch("/api/jobs/enhance/init", {
+      method:"POST",
+      headers:{ "Content-Type":"application/json" },
+      body:JSON.stringify({
+        files: files.map(f => ({ name: f.file.name, mime: f.file.type || (f.kind==="video" ? "video/mp4" : "audio/wav") })),
+        params: {
+          hpf_hz:  ctl.hpf === "60Hz" ? 60 : ctl.hpf === "80Hz" ? 80 : 80,
+          denoise_nf: -25,
+          voice_db:  ctl.voiceGainDb,
+          bg_db:    -(ctl.bgPercent/100)*24
+        }
       })
+    });
 
-      // 4) progress
-      const es = new EventSource(`/api/jobs/events?id=${init.job_id}`)
-      es.onmessage = async (e) => {
-        try {
-          const ev = JSON.parse(e.data)
-          if (ev.message === "progress") setProgress(p => Math.min(95, p + 2))
-          if (ev.message === "Completed") {
-            es.close(); setProgress(100); setIsProcessing(false)
-            // fetch stems → switch to enhanced preview
-            const voc = await fetch(`/api/jobs/asset?id=${init.job_id}&file=vocals.wav`).then(r=>r.json()).then(j=>decodeUrlToBuffer(j.url))
-            const bg  = await fetch(`/api/jobs/asset?id=${init.job_id}&file=bg.wav`).then(r=>r.json()).then(j=>decodeUrlToBuffer(j.url))
-            const enh = await fetch(`/api/jobs/asset?id=${init.job_id}&file=enhanced.wav`).then(r=>r.json()).then(j=>decodeUrlToBuffer(j.url))
-            stemsRef.current.voc = voc; stemsRef.current.bg = bg; stemsRef.current.enh = enh
-            setStemsReady(true); setMode("enhanced"); setMonitor("mix"); setPlaying(false)
-          }
-          if (ev.message === "Failed") { es.close(); setIsProcessing(false); alert("Processing failed.") }
-        } catch {}
-      }
-    } catch (e) {
-      console.error(e); alert("Processing failed.")
-      setIsProcessing(false)
+    if (!initRes.ok) return fail(`INIT failed: ${await initRes.text()}`);
+    const init = await initRes.json();
+    if (!init?.job_id || !Array.isArray(init?.uploads)) return fail(`INIT bad payload: ${JSON.stringify(init)}`);
+
+    setJobId(init.job_id);
+
+    // 2) UPLOAD — direct to Supabase Storage (inputs/)
+    for (let i = 0; i < files.length; i++) {
+      const u = init.uploads[i]; const f = files[i].file;
+      // @ts-ignore
+      const up = await supa.storage.from("inputs").uploadToSignedUrl(u.path, u.token, f);
+      // @ts-ignore
+      if (up?.error) return fail(`UPLOAD failed: ${up.error.message || up.error}`);
     }
+
+    // 3) SUBMIT — attach storage paths so the worker can pick the job
+    const submitRes = await fetch("/api/jobs/submit",{
+      method:"POST",
+      headers:{ "Content-Type":"application/json" },
+      body:JSON.stringify({ job_id:init.job_id, paths:init.uploads.map((u:any)=>u.path) })
+    });
+    if (!submitRes.ok) return fail(`SUBMIT failed: ${await submitRes.text()}`);
+
+    // 4) PROGRESS — show real errors from the worker
+    const es = new EventSource(`/api/jobs/events?id=${init.job_id}`);
+    es.onmessage = async (e) => {
+      const ev = JSON.parse(e.data);
+
+      if (ev.message === "progress") setProgress(p => Math.min(95, p + 3));
+
+      if (ev.message === "Failed") {
+        es.close();
+        setIsProcessing(false);
+        return fail(`WORKER failed: ${ev?.data?.error || "unknown error"}`);
+      }
+
+      if (ev.message === "Completed") {
+        es.close();
+        setProgress(100);
+        setIsProcessing(false);
+
+        // fetch stems and switch to enhanced preview
+        try {
+          const voc = await fetch(`/api/jobs/asset?id=${init.job_id}&file=vocals.wav`).then(r=>r.json()).then(j=>decodeUrlToBuffer(j.url));
+          const bg  = await fetch(`/api/jobs/asset?id=${init.job_id}&file=bg.wav`).then(r=>r.json()).then(j=>decodeUrlToBuffer(j.url));
+          const enh = await fetch(`/api/jobs/asset?id=${init.job_id}&file=enhanced.wav`).then(r=>r.json()).then(j=>decodeUrlToBuffer(j.url));
+          stemsRef.current.voc = voc; stemsRef.current.bg = bg; stemsRef.current.enh = enh;
+          setStemsReady(true); setMode("enhanced"); setMonitor("mix"); setPlaying(false);
+        } catch (e:any) {
+          return fail(`FETCH-STEMS failed: ${e?.message || e}`);
+        }
+      }
+    };
+  } catch (e:any) {
+    return fail(`PROCESS failed: ${e?.message || e}`)
   }
+}
+
 
   /* ----------------------------------- UI ----------------------------------- */
 
