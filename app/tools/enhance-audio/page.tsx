@@ -15,7 +15,6 @@ import {
   XMarkIcon,
   InformationCircleIcon,
 } from "@heroicons/react/24/solid"
-
 import { createClient } from "@supabase/supabase-js"
 
 /* --------------------------- Types & small helpers --------------------------- */
@@ -26,13 +25,11 @@ type Monitor = "mix" | "vocals" | "background"
 type FileItem = { id: string; file: File; sizeMB: number; kind: Kind }
 
 type Controls = {
-  // Core (always visible)
   voiceGainDb: number
   noisePercent: number
   bgPercent: number
   lufs: "-16" | "-14" | "-12"
   dehum: "Off" | "50Hz" | "60Hz" | "Auto"
-  // Advanced (collapsible)
   deess: number
   mouth: number
   crackle: number
@@ -51,8 +48,7 @@ const filledTrack = (value: number, min = 0, max = 100) => {
 }
 const db2lin = (db: number) => Math.pow(10, db / 20)
 
-/* ----------------------------- WebAudio graph ----------------------------- */
-/** Existing original preview graph (kept). We’ll use it only for mode="original". */
+/* ----------------------------- WebAudio (original) ----------------------------- */
 
 type Graph = {
   mediaEl?: HTMLMediaElement
@@ -132,7 +128,7 @@ function setupGraph(el: HTMLMediaElement) {
   g.splitter.connect(g.gRMinus, 1)
   g.gRMinus.connect(g.diffNode)
 
-  // voice chain
+  // voice chain (original preview approximation)
   g.vHighpass = ctx.createBiquadFilter(); g.vHighpass.type = "highpass"; g.vHighpass.frequency.value = 60
   g.vDeEss = ctx.createBiquadFilter(); g.vDeEss.type = "highshelf"; g.vDeEss.frequency.value = 7000; g.vDeEss.gain.value = 0
   g.vMouthComp = ctx.createDynamicsCompressor(); g.vMouthComp.attack.value = 0.002; g.vMouthComp.release.value = 0.05; g.vMouthComp.ratio.value = 10
@@ -161,7 +157,6 @@ function setupGraph(el: HTMLMediaElement) {
   el.muted = true
 }
 
-/** Apply routing only for ORIGINAL (media element). For ENHANCED we use real stems (below). */
 function applyRoute(mode: "original" | "enhanced", monitor: Monitor) {
   if (mode !== "original") return
   const g = graphRef.current
@@ -210,12 +205,11 @@ const supa = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
   process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
 )
-
 type StemBuffers = { voc?: AudioBuffer; bg?: AudioBuffer; enh?: AudioBuffer; orig?: AudioBuffer }
-const stemsRef = { current: { } as StemBuffers }
+const stemsRef = { current: {} as StemBuffers }
 const stemsNodesRef = { current: [] as AudioNode[] }
 function stopStems() {
-  try { stemsNodesRef.current.forEach((n: any) => n?.disconnect?.()); } catch {}
+  try { stemsNodesRef.current.forEach((n: any) => n?.disconnect?.()) } catch {}
   stemsNodesRef.current = []
 }
 async function decodeUrlToBuffer(url: string) {
@@ -226,26 +220,24 @@ async function decodeUrlToBuffer(url: string) {
 function playStems(monitor: Monitor, ctl: Controls) {
   stopStems()
   const ctx = ensureAudioContext()
-  const chainHighpass = ctx.createBiquadFilter(); chainHighpass.type="highpass"
-  chainHighpass.frequency.value = ctl.hpf === "60Hz" ? 60 : ctl.hpf === "80Hz" ? 80 : 80
+  const hpf = ctx.createBiquadFilter(); hpf.type = "highpass"
+  hpf.frequency.value = ctl.hpf === "60Hz" ? 60 : ctl.hpf === "80Hz" ? 80 : 80
   const master = ctx.createGain(); master.gain.value = 1
-  chainHighpass.connect(master).connect(ctx.destination)
-  stemsNodesRef.current.push(chainHighpass, master)
+  hpf.connect(master).connect(ctx.destination)
+  stemsNodesRef.current.push(hpf, master)
 
-  const addBuf = (buf?: AudioBuffer, db=0) => {
+  const add = (buf?: AudioBuffer, db=0) => {
     if (!buf) return
     const s = ctx.createBufferSource(); s.buffer = buf
     const g = ctx.createGain(); g.gain.value = db2lin(db)
-    s.connect(g).connect(chainHighpass); s.start()
+    s.connect(g).connect(hpf); s.start()
     stemsNodesRef.current.push(s, g)
   }
-
   const voiceDb = ctl.voiceGainDb
-  const bgDb    = - (ctl.bgPercent / 100) * 24   // map 0..100% to 0..-24 dB
-
-  if (monitor === "vocals")      addBuf(stemsRef.current.voc, voiceDb)
-  else if (monitor === "background") addBuf(stemsRef.current.bg, bgDb)
-  else { addBuf(stemsRef.current.voc, voiceDb); addBuf(stemsRef.current.bg, bgDb) }
+  const bgDb = -(ctl.bgPercent/100) * 24
+  if (monitor === "vocals") add(stemsRef.current.voc, voiceDb)
+  else if (monitor === "background") add(stemsRef.current.bg, bgDb)
+  else { add(stemsRef.current.voc, voiceDb); add(stemsRef.current.bg, bgDb) }
 }
 
 /* --------------------------------- Page --------------------------------- */
@@ -297,10 +289,7 @@ export default function EnhanceAudioPage() {
   useEffect(() => {
     if (!isProcessing) return
     let pct = 0
-    const id = setInterval(() => {
-      pct = Math.min(95, pct + Math.random() * 6 + 2)
-      setProgress(Math.round(pct))
-    }, 400)
+    const id = setInterval(() => { pct = Math.min(95, pct + Math.random() * 6 + 2); setProgress(Math.round(pct)) }, 400)
     return () => clearInterval(id)
   }, [isProcessing])
 
@@ -310,11 +299,7 @@ export default function EnhanceAudioPage() {
   const refProcess = useRef<HTMLDivElement>(null)
 
   /* helpers */
-  const onBrowse = () => {
-    if (!inputRef.current) return
-    ;(inputRef.current as HTMLInputElement).value = ""
-    inputRef.current.click()
-  }
+  const onBrowse = () => { if (!inputRef.current) return; (inputRef.current as HTMLInputElement).value = ""; inputRef.current.click() }
   const onPick = (list: FileList | null) => {
     if (!list) return
     const arr: FileItem[] = Array.from(list).map((f) => ({
@@ -323,17 +308,11 @@ export default function EnhanceAudioPage() {
       sizeMB: Math.round((f.size / (1024 * 1024)) * 10) / 10,
       kind: f.type?.startsWith("video") ? "video" : "audio",
     }))
-    setFiles((prev) => [...prev, ...arr])
-    if (!selectedId && arr.length > 0) setSelectedId(arr[0].id)
+    setFiles((prev) => [...prev, ...arr]); if (!selectedId && arr.length > 0) setSelectedId(arr[0].id)
   }
-  const onDrop = (e: React.DragEvent) => {
-    e.preventDefault(); setDrag(false); onPick(e.dataTransfer.files)
-  }
-  const removeFile = (id: string) => {
-    setFiles((p) => p.filter((f) => f.id !== id))
-    if (selectedId === id) setSelectedId(files.find((f) => f.id !== id)?.id ?? null)
-  }
-  const clearAll = () => { setFiles([]); setSelectedId(null); setStemsReady(false); stopStems(); }
+  const onDrop = (e: React.DragEvent) => { e.preventDefault(); setDrag(false); onPick(e.dataTransfer.files) }
+  const removeFile = (id: string) => { setFiles((p) => p.filter((f) => f.id !== id)); if (selectedId === id) setSelectedId(files.find((f) => f.id !== id)?.id ?? null) }
+  const clearAll = () => { setFiles([]); setSelectedId(null); setStemsReady(false); stopStems() }
 
   const hasFiles = files.length > 0
   useEffect(() => { if (applyAll === "one" && hasFiles && !selectedId) setSelectedId(files[0].id) }, [applyAll, hasFiles, selectedId, files])
@@ -348,27 +327,22 @@ export default function EnhanceAudioPage() {
     const ctx = ensureAudioContext(); if (ctx.state === "suspended") { try { await ctx.resume() } catch {} }
 
     if (mode === "enhanced" && stemsReady) {
-      // Play stems (we don’t rely on media element audio)
       if (playing) { stopStems(); el.pause(); setPlaying(false) }
       else {
-        // keep video visuals if any
-        if (currentFile?.kind === "video") { try { el.play(); } catch {} }
+        if (currentFile?.kind === "video") { try { el.play() } catch {} } // keep visuals
         playStems(monitor, ctl); setPlaying(true)
       }
       return
     }
 
-    // ORIGINAL flow (your existing graph)
+    // original path
     if (playing) { el.pause(); setPlaying(false) }
     else { try { await el.play(); setPlaying(true) } catch {} }
   }
 
   const onLoadedMedia = async () => {
     const el = mediaEl(); if (!el) return
-    setupGraph(el)
-    updateGraphFromControls(ctl)
-    applyRoute(mode, monitor)
-    // decode original so "Original" toggle can play even when video is paused
+    setupGraph(el); updateGraphFromControls(ctl); applyRoute(mode, monitor)
     try {
       const ctx = ensureAudioContext()
       if (currentSrc) {
@@ -383,48 +357,42 @@ export default function EnhanceAudioPage() {
     const onEnded = () => setPlaying(false)
     el.addEventListener("ended", onEnded)
     return () => el.removeEventListener("ended", onEnded)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentFile?.id])
 
+  // Auto-switch to Enhanced+Vocals when advanced sliders move (so changes are audible)
   useEffect(() => {
     if (!hasFiles) return
-    setUpdatingPreview(true)
-    const t = setTimeout(() => setUpdatingPreview(false), 400)
-    return () => clearTimeout(t)
-  }, [ctl])
-
-  // When sliders change while listening to stems, restart stems with new gains/HPF
-  useEffect(() => {
-    if (mode === "enhanced" && stemsReady && playing) {
-      playStems(monitor, ctl)
+    const vocalOnlyTouched = true // any advanced change implies vocals focus
+    if (vocalOnlyTouched) {
+      if (mode !== "enhanced") setMode("enhanced")
+      if (monitor !== "vocals") setMonitor("vocals")
+      if (stemsReady && playing) playStems("vocals", ctl)
     } else {
       updateGraphFromControls(ctl)
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ctl])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ctl.deess, ctl.mouth, ctl.crackle, ctl.plosive, ctl.dereverb, ctl.hpf])
 
-  // Route switch
   useEffect(() => {
     if (mode === "enhanced" && stemsReady) {
-      // stop original audio path
       try { mediaEl()?.pause() } catch {}
       if (playing) playStems(monitor, ctl)
     } else {
       stopStems()
       applyRoute("original", monitor)
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, monitor, currentFile?.id, stemsReady])
 
   const count = files.length || 0
   const processLabel = applyAll === "all" ? `Process ${count} file${count > 1 ? "s" : ""}` : "Process this file"
 
-  /* -------------------------- API: Process & Export -------------------------- */
+  /* -------------------------- JOBS: Process & Export -------------------------- */
   async function processAndExport() {
     if (!files.length || isProcessing) return
     setIsProcessing(true); setProgress(1)
     try {
-      // 1) init job → signed upload URL(s)
+      // 1) init job
       const init = await fetch("/api/jobs/enhance/init", {
         method:"POST",
         headers:{ "Content-Type":"application/json" },
@@ -441,7 +409,7 @@ export default function EnhanceAudioPage() {
       if (!init?.job_id) throw new Error("init failed")
       setJobId(init.job_id)
 
-      // 2) direct to Storage uploads (inputs/)
+      // 2) upload to inputs/
       for (let i=0;i<files.length;i++){
         const u = init.uploads[i], f = files[i].file
         // @ts-ignore
@@ -450,13 +418,13 @@ export default function EnhanceAudioPage() {
         if (up.error) throw new Error(up.error.message)
       }
 
-      // 3) confirm so worker can pick the job
+      // 3) submit
       await fetch("/api/jobs/submit",{
         method:"POST", headers:{ "Content-Type":"application/json" },
         body:JSON.stringify({ job_id:init.job_id, paths:init.uploads.map((u:any)=>u.path) })
       })
 
-      // 4) stream progress
+      // 4) progress
       const es = new EventSource(`/api/jobs/events?id=${init.job_id}`)
       es.onmessage = async (e) => {
         try {
@@ -464,7 +432,7 @@ export default function EnhanceAudioPage() {
           if (ev.message === "progress") setProgress(p => Math.min(95, p + 2))
           if (ev.message === "Completed") {
             es.close(); setProgress(100); setIsProcessing(false)
-            // fetch stems for live enhanced preview
+            // fetch stems → switch to enhanced preview
             const voc = await fetch(`/api/jobs/asset?id=${init.job_id}&file=vocals.wav`).then(r=>r.json()).then(j=>decodeUrlToBuffer(j.url))
             const bg  = await fetch(`/api/jobs/asset?id=${init.job_id}&file=bg.wav`).then(r=>r.json()).then(j=>decodeUrlToBuffer(j.url))
             const enh = await fetch(`/api/jobs/asset?id=${init.job_id}&file=enhanced.wav`).then(r=>r.json()).then(j=>decodeUrlToBuffer(j.url))
@@ -667,7 +635,7 @@ export default function EnhanceAudioPage() {
                     </div>
                   </div>
 
-                  {/* advanced (collapsed by default) */}
+                  {/* advanced */}
                   <div className="bg-white border border-gray-200 rounded-2xl shadow-sm">
                     <button className="w-full px-4 py-3 text-left flex items-center justify-between" onClick={() => setAdvancedOpen(v => !v)}>
                       <div>
@@ -718,22 +686,22 @@ export default function EnhanceAudioPage() {
             {/* single hidden input */}
             <input ref={inputRef} type="file" multiple accept="audio/*,video/*" hidden onChange={(e) => onPick(e.target.files)} />
           </div>
-        
-            {/* processing overlay */}
-            {isProcessing && (
-              <div className="fixed bottom-16 left-0 right-0 z-50">
-                <div className="mx-auto max-w-6xl px-8">
-                  <div className="h-2 rounded-full bg-gray-200 overflow-hidden">
-                    <div className="h-full bg-[#5765F2]" style={{ width: progress + "%"}} />
-                  </div>
-                  <div className="mt-1 text-xs text-gray-600">Processing… please keep this tab open. Quality “Max” may take longer.</div>
+
+          {/* processing overlay */}
+          {isProcessing && (
+            <div className="fixed bottom-16 left-0 right-0 z-50">
+              <div className="mx-auto max-w-6xl px-8">
+                <div className="h-2 rounded-full bg-gray-200 overflow-hidden">
+                  <div className="h-full bg-[#5765F2]" style={{ width: progress + "%"}} />
                 </div>
+                <div className="mt-1 text-xs text-gray-600">Processing… please keep this tab open. Quality “Max” may take longer.</div>
               </div>
-            )}
-</main>
+            </div>
+          )}
+        </main>
       </div>
 
-      {/* minimal page-scoped styles for sliders and segmented controls */}
+      {/* minimal styles */}
       <style jsx global>{`
         .nice-range { -webkit-appearance:none; appearance:none; width:100%; height:14px; border-radius:9999px; background:#e6e8f0; cursor:pointer; }
         .nice-range::-webkit-slider-runnable-track, .nice-range::-moz-range-track { height:14px; border-radius:9999px; background:transparent; }
