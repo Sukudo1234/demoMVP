@@ -16,6 +16,8 @@ import {
   InformationCircleIcon,
 } from "@heroicons/react/24/solid"
 
+import { createClient } from "@supabase/supabase-js"
+
 /* --------------------------- Types & small helpers --------------------------- */
 
 type Kind = "audio" | "video"
@@ -50,6 +52,7 @@ const filledTrack = (value: number, min = 0, max = 100) => {
 const db2lin = (db: number) => Math.pow(10, db / 20)
 
 /* ----------------------------- WebAudio graph ----------------------------- */
+/** Existing original preview graph (kept). We’ll use it only for mode="original". */
 
 type Graph = {
   mediaEl?: HTMLMediaElement
@@ -88,7 +91,6 @@ function setupGraph(el: HTMLMediaElement) {
   const ctx = ensureAudioContext()
   const g: Graph = {}
   graphRef.current = g
-  // disconnect old
   try { graphRef.current.source?.disconnect() } catch {}
 
   g.mediaEl = el
@@ -149,7 +151,7 @@ function setupGraph(el: HTMLMediaElement) {
 
   // bg chain
   g.bNoiseLo = ctx.createBiquadFilter(); g.bNoiseLo.type = "lowshelf"; g.bNoiseLo.frequency.value = 150; g.bNoiseLo.gain.value = 0
-  g.bNoiseHi = ctx.createBiquadFilter(); g.bNoiseHi.type = "highshelf"; g.bNoiseHi.frequency.value = 9000; g.bNoiseHi.gain.value = 0
+  g.bNoiseHi = ctx.createBiquadFilter(); g.bNoiseHi.type = "highshelf"; g.bNoiseHi.gain.value = 0; g.bNoiseHi.frequency.value = 9000
   g.bGain = ctx.createGain(); g.bGain.gain.value = 1
   g.diffNode
     .connect(g.bNoiseLo)
@@ -159,7 +161,9 @@ function setupGraph(el: HTMLMediaElement) {
   el.muted = true
 }
 
+/** Apply routing only for ORIGINAL (media element). For ENHANCED we use real stems (below). */
 function applyRoute(mode: "original" | "enhanced", monitor: Monitor) {
+  if (mode !== "original") return
   const g = graphRef.current
   const ctx = ensureAudioContext()
   if (!g.source) return
@@ -167,10 +171,6 @@ function applyRoute(mode: "original" | "enhanced", monitor: Monitor) {
   try { g.vGain?.disconnect(ctx.destination) } catch {}
   try { g.bGain?.disconnect(ctx.destination) } catch {}
 
-  if (mode === "original") {
-    g.source.connect(ctx.destination)
-    return
-  }
   if (monitor === "mix") {
     g.vGain?.connect(ctx.destination); g.bGain?.connect(ctx.destination)
   } else if (monitor === "vocals") {
@@ -183,31 +183,17 @@ function applyRoute(mode: "original" | "enhanced", monitor: Monitor) {
 function updateGraphFromControls(ctl: Controls) {
   const g = graphRef.current
   if (!g.ctx || !g.source) return
-
-  // gains
   g.vGain!.gain.value = db2lin(ctl.voiceGainDb)
   g.bGain!.gain.value = 1 - ctl.bgPercent / 100
-
-  // high-pass + plosives
   const hp = ctl.hpf === "60Hz" ? 60 : ctl.hpf === "80Hz" ? 80 : (ctl.plosive ? 70 + Math.round(ctl.plosive * 0.8) : 60)
   g.vHighpass!.frequency.value = hp
-
-  // de-ess
   g.vDeEss!.gain.value = -((ctl.deess / 100) * 12)
-
-  // noise shelving
   const lowCut = -((ctl.noisePercent / 100) * 12)
   const hiCut = -((ctl.noisePercent / 100) * 9)
   g.vNoiseLo!.gain.value = lowCut; g.vNoiseHi!.gain.value = hiCut
   g.bNoiseLo!.gain.value = lowCut * 0.6; g.bNoiseHi!.gain.value = hiCut * 0.6
-
-  // mouth clicks (compressor)
   g.vMouthComp!.threshold.value = -20 - (ctl.mouth / 100) * 10
-
-  // dereverb (soft gate)
   g.vDereverbComp!.threshold.value = -50 + (ctl.dereverb / 100) * 20
-
-  // dehum notches
   const base = ctl.dehum === "Auto" ? 50 : ctl.dehum === "Off" ? 0 : parseInt(ctl.dehum, 10)
   if (g.notches && g.notches.length) {
     const freqs = base ? [base, base * 2, base * 3, base * 4] : [50, 100, 150, 200]
@@ -216,6 +202,50 @@ function updateGraphFromControls(ctl: Controls) {
       n.Q.value = base ? 20 : 0.001
     })
   }
+}
+
+/* ----------------------- Stems-based enhanced preview ---------------------- */
+
+const supa = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+)
+
+type StemBuffers = { voc?: AudioBuffer; bg?: AudioBuffer; enh?: AudioBuffer; orig?: AudioBuffer }
+const stemsRef = { current: { } as StemBuffers }
+const stemsNodesRef = { current: [] as AudioNode[] }
+function stopStems() {
+  try { stemsNodesRef.current.forEach((n: any) => n?.disconnect?.()); } catch {}
+  stemsNodesRef.current = []
+}
+async function decodeUrlToBuffer(url: string) {
+  const ctx = ensureAudioContext()
+  const ab = await fetch(url).then(r=>r.arrayBuffer())
+  return await ctx.decodeAudioData(ab.slice(0))
+}
+function playStems(monitor: Monitor, ctl: Controls) {
+  stopStems()
+  const ctx = ensureAudioContext()
+  const chainHighpass = ctx.createBiquadFilter(); chainHighpass.type="highpass"
+  chainHighpass.frequency.value = ctl.hpf === "60Hz" ? 60 : ctl.hpf === "80Hz" ? 80 : 80
+  const master = ctx.createGain(); master.gain.value = 1
+  chainHighpass.connect(master).connect(ctx.destination)
+  stemsNodesRef.current.push(chainHighpass, master)
+
+  const addBuf = (buf?: AudioBuffer, db=0) => {
+    if (!buf) return
+    const s = ctx.createBufferSource(); s.buffer = buf
+    const g = ctx.createGain(); g.gain.value = db2lin(db)
+    s.connect(g).connect(chainHighpass); s.start()
+    stemsNodesRef.current.push(s, g)
+  }
+
+  const voiceDb = ctl.voiceGainDb
+  const bgDb    = - (ctl.bgPercent / 100) * 24   // map 0..100% to 0..-24 dB
+
+  if (monitor === "vocals")      addBuf(stemsRef.current.voc, voiceDb)
+  else if (monitor === "background") addBuf(stemsRef.current.bg, bgDb)
+  else { addBuf(stemsRef.current.voc, voiceDb); addBuf(stemsRef.current.bg, bgDb) }
 }
 
 /* --------------------------------- Page --------------------------------- */
@@ -238,8 +268,12 @@ export default function EnhanceAudioPage() {
   const [monitor, setMonitor] = useState<Monitor>("mix")
   const [updatingPreview, setUpdatingPreview] = useState(false)
 
+  /* worker/job */
+  const [jobId, setJobId] = useState<string>("")
+  const [stemsReady, setStemsReady] = useState(false)
+
   /* controls */
-  const [advancedOpen, setAdvancedOpen] = useState(false) // collapsed by default
+  const [advancedOpen, setAdvancedOpen] = useState(false)
   const [ctl, setCtl] = useState<Controls>({
     voiceGainDb: 3,
     noisePercent: 60,
@@ -270,7 +304,6 @@ export default function EnhanceAudioPage() {
     return () => clearInterval(id)
   }, [isProcessing])
 
-
   /* sections for step strip scroll */
   const refAdd = useRef<HTMLDivElement>(null)
   const refAdjust = useRef<HTMLDivElement>(null)
@@ -279,7 +312,7 @@ export default function EnhanceAudioPage() {
   /* helpers */
   const onBrowse = () => {
     if (!inputRef.current) return
-    ;(inputRef.current as HTMLInputElement).value = "" // allow reselecting same names
+    ;(inputRef.current as HTMLInputElement).value = ""
     inputRef.current.click()
   }
   const onPick = (list: FileList | null) => {
@@ -300,7 +333,7 @@ export default function EnhanceAudioPage() {
     setFiles((p) => p.filter((f) => f.id !== id))
     if (selectedId === id) setSelectedId(files.find((f) => f.id !== id)?.id ?? null)
   }
-  const clearAll = () => { setFiles([]); setSelectedId(null) }
+  const clearAll = () => { setFiles([]); setSelectedId(null); setStemsReady(false); stopStems(); }
 
   const hasFiles = files.length > 0
   useEffect(() => { if (applyAll === "one" && hasFiles && !selectedId) setSelectedId(files[0].id) }, [applyAll, hasFiles, selectedId, files])
@@ -313,14 +346,36 @@ export default function EnhanceAudioPage() {
   const togglePlay = async () => {
     const el = mediaEl(); if (!el) return
     const ctx = ensureAudioContext(); if (ctx.state === "suspended") { try { await ctx.resume() } catch {} }
-    if (playing) { el.pause(); setPlaying(false) } else { try { await el.play(); setPlaying(true) } catch {} }
+
+    if (mode === "enhanced" && stemsReady) {
+      // Play stems (we don’t rely on media element audio)
+      if (playing) { stopStems(); el.pause(); setPlaying(false) }
+      else {
+        // keep video visuals if any
+        if (currentFile?.kind === "video") { try { el.play(); } catch {} }
+        playStems(monitor, ctl); setPlaying(true)
+      }
+      return
+    }
+
+    // ORIGINAL flow (your existing graph)
+    if (playing) { el.pause(); setPlaying(false) }
+    else { try { await el.play(); setPlaying(true) } catch {} }
   }
 
-  const onLoadedMedia = () => {
+  const onLoadedMedia = async () => {
     const el = mediaEl(); if (!el) return
     setupGraph(el)
     updateGraphFromControls(ctl)
     applyRoute(mode, monitor)
+    // decode original so "Original" toggle can play even when video is paused
+    try {
+      const ctx = ensureAudioContext()
+      if (currentSrc) {
+        const ab = await fetch(currentSrc).then(r=>r.arrayBuffer())
+        stemsRef.current.orig = await ctx.decodeAudioData(ab.slice(0))
+      }
+    } catch {}
   }
 
   useEffect(() => {
@@ -338,40 +393,89 @@ export default function EnhanceAudioPage() {
     return () => clearTimeout(t)
   }, [ctl])
 
-  useEffect(() => { updateGraphFromControls(ctl) }, [ctl])
-  useEffect(() => { applyRoute(mode, monitor) }, [mode, monitor, currentFile?.id])
+  // When sliders change while listening to stems, restart stems with new gains/HPF
+  useEffect(() => {
+    if (mode === "enhanced" && stemsReady && playing) {
+      playStems(monitor, ctl)
+    } else {
+      updateGraphFromControls(ctl)
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ctl])
+
+  // Route switch
+  useEffect(() => {
+    if (mode === "enhanced" && stemsReady) {
+      // stop original audio path
+      try { mediaEl()?.pause() } catch {}
+      if (playing) playStems(monitor, ctl)
+    } else {
+      stopStems()
+      applyRoute("original", monitor)
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, monitor, currentFile?.id, stemsReady])
 
   const count = files.length || 0
   const processLabel = applyAll === "all" ? `Process ${count} file${count > 1 ? "s" : ""}` : "Process this file"
 
   /* -------------------------- API: Process & Export -------------------------- */
   async function processAndExport() {
-    // Trigger processing overlay
-
     if (!files.length || isProcessing) return
-    setIsProcessing(true)
+    setIsProcessing(true); setProgress(1)
     try {
-      const fd = new FormData()
-      fd.append("settings", JSON.stringify(ctl))
-      files.forEach((f) => fd.append("files", f.file, f.file.name))
+      // 1) init job → signed upload URL(s)
+      const init = await fetch("/api/jobs/enhance/init", {
+        method:"POST",
+        headers:{ "Content-Type":"application/json" },
+        body:JSON.stringify({
+          files: files.map(f=>({ name: f.file.name, mime: f.file.type || (f.kind==="video" ? "video/mp4" : "audio/wav") })),
+          params: {
+            hpf_hz:  ctl.hpf === "60Hz" ? 60 : ctl.hpf === "80Hz" ? 80 : 80,
+            denoise_nf: -25,
+            voice_db: ctl.voiceGainDb,
+            bg_db: -(ctl.bgPercent/100)*24
+          }
+        })
+      }).then(r=>r.json())
+      if (!init?.job_id) throw new Error("init failed")
+      setJobId(init.job_id)
 
-      const res = await fetch("/api/enhance", { method: "POST", body: fd })
-      if (!res.ok) throw new Error(await res.text())
+      // 2) direct to Storage uploads (inputs/)
+      for (let i=0;i<files.length;i++){
+        const u = init.uploads[i], f = files[i].file
+        // @ts-ignore
+        const up = await supa.storage.from("inputs").uploadToSignedUrl(u.path, u.token, f)
+        // @ts-ignore
+        if (up.error) throw new Error(up.error.message)
+      }
 
-      const blob = await res.blob()
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement("a")
-      const isZip = res.headers.get("content-type")?.includes("zip")
-      a.href = url
-      a.download = isZip
-        ? "sukudo-enhanced.zip"
-        : files[0].file.name.replace(/\.[^.]+$/, "") + (files[0].kind === "video" ? ".enhanced.mp4" : ".enhanced.m4a")
-      document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url)
+      // 3) confirm so worker can pick the job
+      await fetch("/api/jobs/submit",{
+        method:"POST", headers:{ "Content-Type":"application/json" },
+        body:JSON.stringify({ job_id:init.job_id, paths:init.uploads.map((u:any)=>u.path) })
+      })
+
+      // 4) stream progress
+      const es = new EventSource(`/api/jobs/events?id=${init.job_id}`)
+      es.onmessage = async (e) => {
+        try {
+          const ev = JSON.parse(e.data)
+          if (ev.message === "progress") setProgress(p => Math.min(95, p + 2))
+          if (ev.message === "Completed") {
+            es.close(); setProgress(100); setIsProcessing(false)
+            // fetch stems for live enhanced preview
+            const voc = await fetch(`/api/jobs/asset?id=${init.job_id}&file=vocals.wav`).then(r=>r.json()).then(j=>decodeUrlToBuffer(j.url))
+            const bg  = await fetch(`/api/jobs/asset?id=${init.job_id}&file=bg.wav`).then(r=>r.json()).then(j=>decodeUrlToBuffer(j.url))
+            const enh = await fetch(`/api/jobs/asset?id=${init.job_id}&file=enhanced.wav`).then(r=>r.json()).then(j=>decodeUrlToBuffer(j.url))
+            stemsRef.current.voc = voc; stemsRef.current.bg = bg; stemsRef.current.enh = enh
+            setStemsReady(true); setMode("enhanced"); setMonitor("mix"); setPlaying(false)
+          }
+          if (ev.message === "Failed") { es.close(); setIsProcessing(false); alert("Processing failed.") }
+        } catch {}
+      }
     } catch (e) {
-      console.error(e)
-      alert("Processing failed.")
-    } finally {
-      try { setProgress(100) } catch {}
+      console.error(e); alert("Processing failed.")
       setIsProcessing(false)
     }
   }
