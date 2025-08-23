@@ -388,20 +388,22 @@ export default function EnhanceAudioPage() {
   const processLabel = applyAll === "all" ? `Process ${count} file${count > 1 ? "s" : ""}` : "Process this file"
 
   /* -------------------------- JOBS: Process & Export -------------------------- */
-  async function processAndExport() {
+ async function processAndExport() {
   if (!files.length || isProcessing) return
   setIsProcessing(true); setProgress(1)
 
-  // helper to bail with a readable message
   const fail = (msg: string) => { console.error(msg); alert(msg); setIsProcessing(false) }
 
   try {
-    // 1) INIT — ask server for signed upload URLs
+    // 1) INIT — get signed upload URLs
     const initRes = await fetch("/api/jobs/enhance/init", {
       method:"POST",
       headers:{ "Content-Type":"application/json" },
       body:JSON.stringify({
-        files: files.map(f => ({ name: f.file.name, mime: f.file.type || (f.kind==="video" ? "video/mp4" : "audio/wav") })),
+        files: files.map(f => ({
+          name: f.file.name,
+          mime: f.file.type || (f.kind === "video" ? "video/mp4" : "audio/wav")
+        })),
         params: {
           hpf_hz:  ctl.hpf === "60Hz" ? 60 : ctl.hpf === "80Hz" ? 80 : 80,
           denoise_nf: -25,
@@ -410,31 +412,29 @@ export default function EnhanceAudioPage() {
         }
       })
     });
-
     if (!initRes.ok) return fail(`INIT failed: ${await initRes.text()}`);
     const init = await initRes.json();
     if (!init?.job_id || !Array.isArray(init?.uploads)) return fail(`INIT bad payload: ${JSON.stringify(init)}`);
-
     setJobId(init.job_id);
 
-    // 2) UPLOAD — direct to Supabase Storage (inputs/)
+    // 2) UPLOAD — direct to Storage (inputs/)
     for (let i = 0; i < files.length; i++) {
-      const u = init.uploads[i]; const f = files[i].file;
+      const u = init.uploads[i], f = files[i].file
       // @ts-ignore
-      const up = await supa.storage.from("inputs").uploadToSignedUrl(u.path, u.token, f);
+      const up = await supa.storage.from("inputs").uploadToSignedUrl(u.path, u.token, f)
       // @ts-ignore
-      if (up?.error) return fail(`UPLOAD failed: ${up.error.message || up.error}`);
+      if (up?.error) return fail(`UPLOAD failed: ${up.error.message || up.error}`)
     }
 
-    // 3) SUBMIT — attach storage paths so the worker can pick the job
-    const submitRes = await fetch("/api/jobs/submit",{
+    // 3) SUBMIT — attach paths so worker can pick it
+    const submitRes = await fetch("/api/jobs/submit", {
       method:"POST",
       headers:{ "Content-Type":"application/json" },
-      body:JSON.stringify({ job_id:init.job_id, paths:init.uploads.map((u:any)=>u.path) })
+      body:JSON.stringify({ job_id: init.job_id, paths: init.uploads.map((u:any)=>u.path) })
     });
     if (!submitRes.ok) return fail(`SUBMIT failed: ${await submitRes.text()}`);
 
-    // 4) PROGRESS — show real errors from the worker
+    // 4) PROGRESS — show worker errors; load stems on complete
     const es = new EventSource(`/api/jobs/events?id=${init.job_id}`);
     es.onmessage = async (e) => {
       const ev = JSON.parse(e.data);
@@ -442,17 +442,13 @@ export default function EnhanceAudioPage() {
       if (ev.message === "progress") setProgress(p => Math.min(95, p + 3));
 
       if (ev.message === "Failed") {
-        es.close();
-        setIsProcessing(false);
+        es.close(); setIsProcessing(false);
         return fail(`WORKER failed: ${ev?.data?.error || "unknown error"}`);
       }
 
       if (ev.message === "Completed") {
-        es.close();
-        setProgress(100);
-        setIsProcessing(false);
+        es.close(); setProgress(100); setIsProcessing(false);
 
-        // fetch stems and switch to enhanced preview
         try {
           const voc = await fetch(`/api/jobs/asset?id=${init.job_id}&file=vocals.wav`).then(r=>r.json()).then(j=>decodeUrlToBuffer(j.url));
           const bg  = await fetch(`/api/jobs/asset?id=${init.job_id}&file=bg.wav`).then(r=>r.json()).then(j=>decodeUrlToBuffer(j.url));
@@ -468,7 +464,6 @@ export default function EnhanceAudioPage() {
     return fail(`PROCESS failed: ${e?.message || e}`)
   }
 }
-
 
   /* ----------------------------------- UI ----------------------------------- */
 
